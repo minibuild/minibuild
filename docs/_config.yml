@@ -1,0 +1,3 @@
+title: MiniBuild build system
+description: MiniBuild build system is a pure Python package aimed to build executables, static and shared libraries from C, C++ and ASM source files.
+theme: jekyll-theme-cayman

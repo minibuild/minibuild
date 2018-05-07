@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+SELF_SCRIPT="$0"
+if [ -L "$SELF_SCRIPT" ]; then
+    SELF_SCRIPT=$(readlink -e $SELF_SCRIPT)
+fi
+DIR_HERE=$(cd $(dirname $SELF_SCRIPT) && pwd)
+DIR_PYPATH=$(cd "${DIR_HERE}/../.." && pwd)
+export PYTHONPATH=$DIR_PYPATH
+if [ -x "$(which python3 2>/dev/null)" ]; then
+    exec python3 -m minibuild "$@"
+else
+    exec python -m minibuild "$@"
+fi
