@@ -4,14 +4,17 @@ import importlib
 import os
 import os.path
 import platform
+import shlex
 import sys
 
-from .build_description import BuildDescriptionLoader
+from .build_description import BuildDescriptionLoader, makefile_is_project_landmark
 from .build_workflow import BuildWorkflow
 from .config_ini import *
 from .constants import *
 from .error_utils import BuildSystemException
+from .gen_bconf import generate_build_config
 from .os_utils import *
+from .__version__ import __version__
 
 
 SUPPORTED_PLATFORMS_PROBE = [
@@ -24,22 +27,71 @@ SUPPORTED_PLATFORMS_PROBE = [
     (is_windows_32bit,      TAG_PLATFORM_WINDOWS,       TAG_ARCH_X86),
 ]
 
-def resolve_project_landmark(build_directory):
-    root_variant = None
-    lookup_sequence = []
+
+def parse_landmark_details(value, config_proto, pragma_line):
+    landmark_options = {}
+    args = []
+    if value:
+        args = shlex.split(value)
+    for arg in args:
+        if '=' not in arg:
+            raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, malformed token: '{}'.".format(config_proto, pragma_line, arg))
+        k, v = arg.split('=', 1)
+        landmark_options[k] = v
+    return landmark_options
+
+
+def resolve_project_landmark(build_directory, verbose):
+    dname = None
+    dir_sequence = []
     while True:
-        if root_variant is None:
-            root_variant = build_directory
+        if dname is None:
+            dname = build_directory
+            dir_sequence.append(dname)
         else:
-            last_root_variant = root_variant
-            root_variant = os.path.normpath(os.path.join(last_root_variant, os.pardir))
-            if last_root_variant == root_variant:
-                raise BuildSystemException("Can't resolve project root while trying the following lookup sequence:\n  {}"
-                    .format('\n  '.join(lookup_sequence)))
-        config_variant = os.path.normpath(os.path.join(root_variant, BUILD_SYSTEM_CONFIG_FILE))
-        lookup_sequence.append(config_variant)
+            last_root_variant = dname
+            dname = os.path.normpath(os.path.join(last_root_variant, os.pardir))
+            if dname == last_root_variant:
+                break
+            dir_sequence.append(dname)
+
+    lookup_sequence1 = []
+    for dname in dir_sequence:
+        config_variant = os.path.normpath(os.path.join(dname, BUILD_SYSTEM_CONFIG_FILE))
+        lookup_sequence1.append(config_variant)
         if os.path.isfile(config_variant):
-            return root_variant
+            return dname, None, None
+
+    any_makefile = False
+    lookup_sequence2 = []
+    for dname in reversed(dir_sequence):
+        config_variant = os.path.normpath(os.path.join(dname, BUILD_MODULE_DESCRIPTION_FILE))
+        if os.path.isfile(config_variant):
+            any_makefile = True
+            lookup_sequence2.append(config_variant)
+            is_landmark, landmark_details, pragma_line = makefile_is_project_landmark(config_variant)
+            if is_landmark:
+                landmark_options = parse_landmark_details(landmark_details, config_variant, pragma_line)
+                if verbose:
+                    if landmark_options:
+                        print("BUILDSYS: Landmark: '{}', configuration: {}".format(config_variant, landmark_details))
+                    else:
+                        print("BUILDSYS: Landmark: '{}', configuration: <default>".format(config_variant))
+                project_root = dname
+                if TAG_PRAGMA_BUILD_PROJECT_ROOT in landmark_options and landmark_options[TAG_PRAGMA_BUILD_PROJECT_ROOT]:
+                    project_root = normalize_path_optional(landmark_options[TAG_PRAGMA_BUILD_PROJECT_ROOT], dname)
+                    if verbose:
+                        print("BUILDSYS: Landmark: redirect project-root from '{}' to '{}' due to option '{}'".format(dname, project_root, landmark_options[TAG_PRAGMA_BUILD_PROJECT_ROOT]))
+
+                return project_root, config_variant, landmark_options
+
+    if not any_makefile:
+        raise BuildSystemException("Not a MiniBuild project (or any of the parent directories)")
+
+    if lookup_sequence1 and lookup_sequence2:
+        raise BuildSystemException("Can't resolve project root while trying the following lookup sequences:\n1)  {}\n----\n2)  {}".format('\n    '.join(lookup_sequence1), '\n    '.join(lookup_sequence2)))
+
+    raise BuildSystemException("Can't resolve project root while trying the following lookup sequence:\n  {}".format('\n  '.join(lookup_sequence1)))
 
 
 def auto_eval_native_model(used_model_name, toolset_models_mapping, required, verbose):
@@ -144,112 +196,264 @@ def eval_native_model(used_model_name, toolset_models_mapping, config, sys_platf
     return native_model_remap
 
 
-def create_build_workflow(build_directory, argv):
-    project_root = resolve_project_landmark(build_directory)
-    config_file = os.path.normpath(os.path.join(project_root, BUILD_SYSTEM_CONFIG_FILE))
-    if not os.path.isfile(config_file):
-        raise BuildSystemException("Project config file is not found by path: '{}'.".format(config_file))
+def read_model_aliases(config):
+    model_aliases = {}
+    if config.has_section(TAG_INI_CONF_MAIN_ALIAS):
+        aliases = config.options(TAG_INI_CONF_MAIN_ALIAS)
+        for alias in aliases:
+            model_name = get_ini_conf_string1(config, TAG_INI_CONF_MAIN_ALIAS, alias)
+            model_aliases[alias] = model_name
+    return model_aliases
 
-    current_platform = platform.system()
-    if not current_platform:
-        current_platform = sys.platform
 
-    for os_probe, sys_platform, sys_arch in SUPPORTED_PLATFORMS_PROBE:
-        if os_probe():
-            break
-    else:
-        raise BuildSystemException("Current platform '{}' is not supported.".format(current_platform))
+def eval_default_model(config, sys_platform, sys_arch):
+    return get_ini_conf_string0(config, TAG_INI_CONF_MAIN_DEFAULT, '{}-{}'.format(sys_platform, sys_arch))
 
-    config = load_ini_config(path=config_file)
 
-    platform_cfg_option = 'toolset-{}'.format(sys_platform)
-    toolset_sections_names = get_ini_conf_strings_optional(config, TAG_INI_CONF_MAIN, platform_cfg_option)
-    if not toolset_sections_names:
-        raise BuildSystemException("Malformed project config file: got empty value at '{}/{}'.".format(TAG_INI_CONF_MAIN, platform_cfg_option))
+class ArgumentParserExit(Exception):
+    pass
 
-    toolset_init_requests = []
-    for toolset_section in toolset_sections_names:
-        toolset_module_title = get_ini_conf_string0(config, toolset_section, TAG_INI_TOOLSET_MODULE)
-        if toolset_module_title is None:
-            raise BuildSystemException("Malformed project config file: option not found at '{}/{}'.".format(toolset_section, TAG_INI_TOOLSET_MODULE))
-        if not toolset_module_title:
-            raise BuildSystemException("Malformed project config file: got empty value at '{}/{}'.".format(toolset_section, TAG_INI_TOOLSET_MODULE))
-        toolset_serialized_config = get_ini_conf_string0(config, toolset_section, TAG_INI_TOOLSET_CONFIG)
-        if toolset_serialized_config:
-            ast = compile(toolset_serialized_config, '<toolset-config>', 'eval')
-            toolset_init_args = eval(ast, {"__builtins__": None}, {})
+
+class ArgumentParser(argparse.ArgumentParser):
+    def __init__(*args, **kwargs):
+        argparse.ArgumentParser.__init__(*args, **kwargs)
+
+    def exit(self, status=0, message=None):
+        if status == 0:
+            if message:
+                self._print_message(message, sys.stdout)
+            raise ArgumentParserExit()
         else:
-            toolset_init_args = {}
-        toolset_init_requests += [ (toolset_module_title, toolset_init_args) ]
+            msg = message.rstrip('\r\n')
+            strip = ['minibuild:', 'error:']
+            while True:
+                retry = False
+                for s in strip:
+                    if msg.startswith(s):
+                        msg = msg[len(s):].strip()
+                        retry = True
+                        break
+                if not retry:
+                    break
+            raise BuildSystemException(msg, exit_code=status)
 
-    bootstrap_dir = os.path.normpath(os.path.join(project_root, BUILD_CONFIG_DEFAULT_BOOTSTRAP_DIR))
-    obj_dir = os.path.normpath(os.path.join(project_root, BUILD_CONFIG_DEFAULT_OBJ_DIR))
-    exe_dir = os.path.normpath(os.path.join(project_root, BUILD_CONFIG_DEFAULT_EXE_DIR))
-    ext_dir = os.path.normpath(os.path.join(project_root, BUILD_CONFIG_DEFAULT_EXT_DIR))
-    static_lib_dir = os.path.normpath(os.path.join(project_root, BUILD_CONFIG_DEFAULT_LIB_DIR))
-    shared_lib_dir = os.path.normpath(os.path.join(project_root, BUILD_CONFIG_DEFAULT_SHARED_DIR))
-    public_dir = os.path.normpath(os.path.join(project_root, BUILD_CONFIG_DEFAULT_PUBLIC_DIR))
 
-    build_description_fname = os.path.join(os.getcwd(), BUILD_MODULE_DESCRIPTION_FILE)
+class ArgumentParserFormat(argparse.HelpFormatter):
+    def _split_lines(self, text, width):
+        if text.startswith('R|'):
+            return text[2:].splitlines()
+        return argparse.HelpFormatter._split_lines(self, text, width)
 
-    mkdir_safe(bootstrap_dir)
-    mkdir_safe(obj_dir)
-    mkdir_safe(exe_dir)
-    mkdir_safe(static_lib_dir)
-    mkdir_safe(shared_lib_dir)
 
-    sysinfo = {
-        TAG_CFG_DIR_PROJECT_ROOT: project_root,
-        TAG_CFG_PROJECT_ROOT_COMMON_PREFIX: ''.join([os.path.normcase(project_root), os.path.sep]),
-        TAG_CFG_DIR_BOOTSTRAP: bootstrap_dir,
-        TAG_CFG_DIR_OBJ: obj_dir,
-        TAG_CFG_DIR_EXE: exe_dir,
-        TAG_CFG_DIR_EXT: ext_dir,
-        TAG_CFG_DIR_LIB: static_lib_dir,
-        TAG_CFG_DIR_SHARED: shared_lib_dir,
-        TAG_CFG_DIR_PUBLIC: public_dir,
-        TAG_CFG_OBJ_SUFFIX : '.obj',
-        TAG_CFG_PDB_SUFFIX : '.pdb',
-        TAG_CFG_DEP_SUFFIX : '.dep',
-    }
+def format_version_string(frozen):
+    ext_bits = []
+    if frozen:
+        ext_bits.append('frozen')
+    ext_bits.append('on python {}.{}.{}'.format(sys.version_info[0], sys.version_info[1], sys.version_info[2]))
+    return "minibuild {} [{}]".format(__version__, ' '.join(ext_bits))
 
-    subst_info = {
-        TAG_SUBST_PROJECT_ROOT: project_root,
-    }
 
-    toolset_models_mapping = {}
+def create_build_workflow(frozen, build_directory, verbose, argv):
+    buildsys_error = None
     toolset_choices = []
-    imported_toolset_modules = {}
-    for toolset_module_title, toolset_init_args in toolset_init_requests:
-        mod_toolset = imported_toolset_modules.get(toolset_module_title)
-        if mod_toolset is None:
-            toolset_module_name = '{}.toolset_{}'.format(__package__, toolset_module_title)
-            mod_toolset = importlib.import_module(toolset_module_name)
-            imported_toolset_modules[toolset_module_title] = mod_toolset
+    model_aliases = {}
+    try:
+        current_platform = platform.system()
+        if not current_platform:
+            current_platform = sys.platform
 
-        desc_loader = BuildDescriptionLoader()
-        toolset = mod_toolset.create_toolset(sysinfo, desc_loader, **toolset_init_args)
-        desc_loader.set_toolset_name(toolset.toolset_name)
-        desc_loader.set_target_platform(toolset.platform_name)
-        desc_loader.set_substitutions(subst_info)
+        for os_probe, sys_platform, sys_arch in SUPPORTED_PLATFORMS_PROBE:
+            if os_probe():
+                break
+        else:
+            raise BuildSystemException("Current platform '{}' is not supported.".format(current_platform))
 
-        toolset_models = toolset.supported_models
-        for model_name in toolset_models:
-            if model_name in toolset_models_mapping:
-                raise BuildSystemException("Malformed project config file: got clash of model names for '{}'.".format(model_name))
-            model = toolset_models[model_name]
-            toolset_models_mapping[model_name] = (toolset, desc_loader)
-            toolset_choices.append(model_name)
+        is_wsl = False
+        if sys_platform == TAG_PLATFORM_LINUX:
+            if os.access('/proc/version', os.R_OK):
+                with open('/proc/version', 'rt') as fp:
+                    proc_version = fp.read()
+                if 'Microsoft' in proc_version:
+                    is_wsl = True
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', nargs=1, choices=toolset_choices, required=True)
-    parser.add_argument('--config', nargs=1, choices=BUILD_CONFIG_ALL, required=True)
-    parser.add_argument('--force', action='store_true')
-    parser.add_argument('--verbose', action='store_true')
-    parser.add_argument('--public', action='store_true')
-    args = parser.parse_args(argv)
+        project_root, conf_mk, conf_options = resolve_project_landmark(build_directory, verbose)
 
-    native_model_remap = eval_native_model(args.model[0], toolset_models_mapping, config, sys_platform, sys_arch, args.verbose)
+        if verbose:
+            if is_wsl:
+                print("BUILDSYS: Landmark: project-root: '{}', on WSL/{} {}".format(project_root, sys_platform, sys_arch))
+            else:
+                print("BUILDSYS: Landmark: project-root: '{}', on {} {}".format(project_root, sys_platform, sys_arch))
+
+        pragma_token_output_dir = TAG_PRAGMA_BUILD_DIR_OUTPUT
+        if is_wsl:
+            if conf_options and TAG_PRAGMA_BUILD_DIR_OUTPUT_WSL in conf_options and conf_options[TAG_PRAGMA_BUILD_DIR_OUTPUT_WSL]:
+                pragma_token_output_dir = TAG_PRAGMA_BUILD_DIR_OUTPUT_WSL
+
+        if conf_options and pragma_token_output_dir in conf_options and conf_options[pragma_token_output_dir]:
+            custom_output_dname = conf_options[pragma_token_output_dir]
+            if custom_output_dname.startswith('@'):
+                custom_output_dname = custom_output_dname.replace('@', project_root, 1)
+
+            output_dname = normalize_path_optional(custom_output_dname, os.path.dirname(conf_mk))
+        else:
+            output_dname = os.path.join(project_root, BUILD_CONFIG_DEFAULT_OUTPUT_DIR)
+
+        if verbose:
+            print("BUILDSYS: Landmark: output directory: '{}'".format(output_dname))
+
+        bootstrap_dir  = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_BOOTSTRAP_DIR))
+        obj_dir        = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_OBJ_DIR))
+        exe_dir        = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_EXE_DIR))
+        ext_dir        = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_EXT_DIR))
+        static_lib_dir = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_LIB_DIR))
+        shared_lib_dir = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_SHARED_DIR))
+        public_dir     = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_PUBLIC_DIR))
+
+        mkdir_safe(bootstrap_dir)
+        mkdir_safe(obj_dir)
+        mkdir_safe(exe_dir)
+        mkdir_safe(static_lib_dir)
+        mkdir_safe(shared_lib_dir)
+
+        sysinfo = {
+            TAG_CFG_FROZEN: frozen,
+            TAG_CFG_DIR_PROJECT_ROOT: project_root,
+            TAG_CFG_PROJECT_ROOT_COMMON_PREFIX: ''.join([os.path.normcase(project_root), os.path.sep]),
+            TAG_CFG_DIR_BOOTSTRAP: bootstrap_dir,
+            TAG_CFG_DIR_OBJ: obj_dir,
+            TAG_CFG_DIR_EXE: exe_dir,
+            TAG_CFG_DIR_EXT: ext_dir,
+            TAG_CFG_DIR_LIB: static_lib_dir,
+            TAG_CFG_DIR_SHARED: shared_lib_dir,
+            TAG_CFG_DIR_PUBLIC: public_dir,
+            TAG_CFG_OBJ_SUFFIX : '.obj',
+            TAG_CFG_PDB_SUFFIX : '.pdb',
+            TAG_CFG_DEP_SUFFIX : '.dep',
+        }
+
+        if conf_mk:
+            config_file = os.path.normpath(os.path.join(bootstrap_dir, '{}-{}'.format(sys_platform, BUILD_SYSTEM_CONFIG_FILE)))
+            generate_build_config(conf_mk, config_file, sys_platform, sys_arch, verbose)
+        else:
+            config_file = os.path.normpath(os.path.join(project_root, BUILD_SYSTEM_CONFIG_FILE))
+        if not os.path.isfile(config_file):
+            raise BuildSystemException("Project config file is not found by path: '{}'.".format(config_file))
+
+        config = load_ini_config(path=config_file)
+        model_aliases = read_model_aliases(config)
+
+        platform_cfg_option = 'toolset-{}'.format(sys_platform)
+        toolset_sections_names = get_ini_conf_strings_optional(config, TAG_INI_CONF_MAIN, platform_cfg_option)
+        if not toolset_sections_names:
+            raise BuildSystemException("Malformed project config file: got empty value at '{}/{}'.".format(TAG_INI_CONF_MAIN, platform_cfg_option))
+
+        toolset_init_requests = []
+        for toolset_section in toolset_sections_names:
+            toolset_module_title = get_ini_conf_string0(config, toolset_section, TAG_INI_TOOLSET_MODULE)
+            if toolset_module_title is None:
+                raise BuildSystemException("Malformed project config file: option not found at '{}/{}'.".format(toolset_section, TAG_INI_TOOLSET_MODULE))
+            if not toolset_module_title:
+                raise BuildSystemException("Malformed project config file: got empty value at '{}/{}'.".format(toolset_section, TAG_INI_TOOLSET_MODULE))
+            toolset_serialized_config = get_ini_conf_string0(config, toolset_section, TAG_INI_TOOLSET_CONFIG)
+            if toolset_serialized_config:
+                ast = compile(toolset_serialized_config, '<toolset-config>', 'eval')
+                toolset_init_args = eval(ast, {"__builtins__": None}, {})
+            else:
+                toolset_init_args = {}
+            toolset_init_requests += [ (toolset_module_title, toolset_init_args) ]
+
+        build_description_fname = os.path.join(os.getcwd(), BUILD_MODULE_DESCRIPTION_FILE)
+
+        subst_info = {
+            TAG_SUBST_PROJECT_ROOT: project_root,
+            TAG_SUBST_PROJECT_OUTPUT: output_dname,
+        }
+
+        toolset_models_mapping = {}
+        imported_toolset_modules = {}
+        for toolset_module_title, toolset_init_args in toolset_init_requests:
+            mod_toolset = imported_toolset_modules.get(toolset_module_title)
+            if mod_toolset is None:
+                try:
+                    toolset_module_name = '{}.toolset_{}'.format(__package__, toolset_module_title)
+                    mod_toolset = importlib.import_module(toolset_module_name)
+                    imported_toolset_modules[toolset_module_title] = mod_toolset
+                except ImportError:
+                    raise BuildSystemException("Malformed project config file: got unknown toolset module: '{}'.".format(toolset_module_title))
+
+            desc_loader = BuildDescriptionLoader()
+            toolset = mod_toolset.create_toolset(sysinfo, desc_loader, **toolset_init_args)
+            desc_loader.set_toolset_name(toolset.toolset_name)
+            desc_loader.set_target_platform(toolset.platform_name)
+            desc_loader.set_substitutions(subst_info)
+
+            toolset_models = toolset.supported_models
+            for model_name in toolset_models:
+                if model_name in toolset_models_mapping:
+                    raise BuildSystemException("Malformed project config file: got clash of model names for '{}'.".format(model_name))
+                model = toolset_models[model_name]
+                toolset_models_mapping[model_name] = (toolset, desc_loader)
+                toolset_choices.append(model_name)
+
+    except BuildSystemException as ex:
+        buildsys_error = ex
+        pass
+
+    if buildsys_error is None:
+        models_help_prefix = '1)primary ' if model_aliases else ''
+        models_help = '{}choices: {}'.format(models_help_prefix, ', '.join(toolset_choices))
+        alias_choises = []
+        for alias in sorted(model_aliases):
+            alias_choises.append(alias)
+        if alias_choises:
+            models_help = "{}\n2)aliases: {}".format(models_help, ', '.join(alias_choises))
+    else:
+        models_help = 'build model'
+
+    parser = ArgumentParser(prog='minibuild', formatter_class=ArgumentParserFormat)
+    parser.add_argument('--model',     nargs='?', help=models_help)
+    parser.add_argument('--config',    nargs='?', choices=BUILD_CONFIG_ALL, default=BUILD_CONFIG_RELEASE, help='build configuration')
+    parser.add_argument('--directory', nargs='?', help='startup directory for build')
+    parser.add_argument('--force',     choices=[-1,0,1,2],  default=0, type=int,
+        help='R|implied rebuild level (default is 0)\n   -1: skip build of dependent targets\n    0: as needed\n    1: force rebuild of current module only\n    2: force rebuild of all targets')
+    parser.add_argument('--public',    action='store_true', help='when building composite target publish it as zip/tgz')
+    parser.add_argument('--verbose',   action='store_true', help='verbose output on build')
+    parser.add_argument('--version',   action='store_true', help='print version number and exit')
+    if frozen:
+        parser.add_argument('--interpreter', action='store_true', help='launch this executable as python interpreter')
+
+    try:
+        args = parser.parse_args(argv)
+    except ArgumentParserExit:
+        return None, None
+
+    if args.version:
+        print(format_version_string(frozen))
+        return None, None
+
+    if buildsys_error is not None:
+        raise buildsys_error
+
+    if not args.model:
+        arg_model = eval_default_model(config, sys_platform, sys_arch)
+        if not arg_model:
+            raise BuildSystemException("Build model is not given in command-line.")
+        else:
+            if verbose:
+                print("BUILDSYS: Using default build model '{}'.".format(arg_model))
+    else:
+        arg_model = args.model
+
+    if arg_model not in toolset_choices and arg_model not in model_aliases:
+        raise BuildSystemException("Got unknown build model '{}' from command-line, try '--help' for more information.".format(arg_model))
+
+    if arg_model in model_aliases:
+        primary_model = model_aliases[arg_model]
+        if verbose:
+            print("BUILDSYS: Build model alias '{}' resolved as '{}'.".format(arg_model, primary_model))
+        arg_model = primary_model
+
+    native_model_remap = eval_native_model(arg_model, toolset_models_mapping, config, sys_platform, sys_arch, verbose)
 
     logic = BuildWorkflow(sysinfo=sysinfo, toolset_models_mapping=toolset_models_mapping, native_model_remap=native_model_remap,
         grammar_substitutions=subst_info)
@@ -257,23 +461,28 @@ def create_build_workflow(build_directory, argv):
     for model_name in toolset_models_mapping:
         _, desc_loader = toolset_models_mapping[model_name]
         desc_loader.set_import_hook(lambda x, y: logic.import_extension(desc_loader, x, y))
+        desc_loader.set_build_config(args.config)
 
     build_args = {}
     build_args['build_directory'] = build_directory
-    build_args['used_model_name'] = args.model[0]
-    build_args['build_config'] = args.config[0]
+    build_args['used_model_name'] = arg_model
+    build_args['build_config'] = args.config
     build_args['public'] = args.public
-    build_args['force_rebuild'] = args.force
-    build_args['verbose'] = args.verbose
+    build_args['rebuild_level'] = args.force
+    build_args['verbose'] = verbose
 
     return logic, build_args
 
 
-def preload_argv():
+def preload_argv(args):
     argv = []
+    verbose = False
     arg_dir = None
     next_arg_is_dir = False
-    for arg in sys.argv[1:]:
+    for arg in args:
+        if arg == '--verbose':
+            verbose = True
+            continue
         if arg_dir is None:
             if next_arg_is_dir:
                 arg_dir = arg
@@ -288,16 +497,27 @@ def preload_argv():
             raise BuildSystemException("Invalid build directoty '{}' is given in command line, directory '{}' is not found.".format(arg_dir, build_directory))
     else:
         build_directory = os.getcwd()
-    return build_directory, argv
+    return build_directory, verbose, argv
 
 
-
-def script_main():
+def script_main(argv=None, frozen=False):
+    safe = True
     try:
-        build_directory, argv = preload_argv()
-        logic, args = create_build_workflow(build_directory, argv)
-        logic.run(**args)
+        if argv is None:
+            argv = sys.argv[1:]
+        else:
+            safe = False
+        if len(argv) == 1 and argv[0] == '--version':
+            print(format_version_string(frozen))
+            return 0
+        build_directory, verbose, argv = preload_argv(argv)
+        logic, args = create_build_workflow(frozen, build_directory, verbose, argv)
+        if logic is not None:
+            logic.run(**args)
+        return 0
 
     except BuildSystemException as exc:
+        if not safe:
+            raise
         print("BUILDSYS: ERROR: {}".format(exc))
         return exc.to_exit_code()

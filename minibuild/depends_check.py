@@ -1,3 +1,4 @@
+import datetime
 import decimal
 import os.path
 import sys
@@ -7,7 +8,8 @@ from .constants import *
 from .error_utils import BuildSystemException
 from .os_utils import load_py_object, normalize_path_optional
 
-_MTIME_PRECISION = decimal.Decimal('0.0001') # 0.0001 second
+_MTIME_PRECISION = decimal.Decimal('0.001') # 0.001 second
+_MTIME_FORMAT = '%Y-%m-%dT%H:%M:%S.%f'
 
 
 def prerequisite_newer_then_target(mt_target, mt_pre, fname_target, fname_pre, verbose):
@@ -15,7 +17,11 @@ def prerequisite_newer_then_target(mt_target, mt_pre, fname_target, fname_pre, v
     mtd_pre = decimal.Decimal(mt_pre).quantize(_MTIME_PRECISION)
     newer = mtd_pre > mtd_target
     if verbose and newer:
-        print("BUILDSYS: prerequisite is newer than target:\n    {} - prerequisite: {}\n    {} - target: {}".format(mtd_pre, fname_pre, mtd_target, fname_target))
+        mtdf_pre = datetime.datetime.fromtimestamp(mtd_pre).strftime(_MTIME_FORMAT)
+        mtdf_pre = mtdf_pre[:-3]
+        mtdf_target = datetime.datetime.fromtimestamp(mtd_target).strftime(_MTIME_FORMAT)
+        mtdf_target = mtdf_target[:-3]
+        print("BUILDSYS: prerequisite is newer than target:\n    {}, i.e. {} - prerequisite: {}\n    {}, i.e. {} - target: {}".format(mtd_pre, mtdf_pre, fname_pre, mtd_target, mtdf_target, fname_target))
     return newer
 
 
@@ -30,14 +36,15 @@ def is_target_up_to_date(target_file_path, obj_files, required_depends, verbose)
 
     target_mtime = os.path.getmtime(target_file_path)
 
-    for dep in required_depends:
-        if isinstance(dep, BuildArtifact):
-            dep_path = dep.path
-        else:
-            dep_path = dep
-        dep_mtime = os.path.getmtime(dep_path)
-        if prerequisite_newer_then_target(target_mtime, dep_mtime, target_file_path, dep_path, verbose):
-            return False, (dep_path, dep_mtime)
+    if required_depends:
+        for dep in required_depends:
+            if isinstance(dep, BuildArtifact):
+                dep_path = dep.path
+            else:
+                dep_path = dep
+            dep_mtime = os.path.getmtime(dep_path)
+            if prerequisite_newer_then_target(target_mtime, dep_mtime, target_file_path, dep_path, verbose):
+                return False, (dep_path, dep_mtime)
 
     if obj_files:
         for obj_file_path in obj_files:
@@ -140,8 +147,7 @@ def eval_prebuilt_lib_list_in_description(description, current_model):
     full_prebuilt_lib_list = []
     for attr_name in all_attr:
         prebuilt_lib_list = getattr(description, attr_name)
-        if prebuilt_lib_list is not None:
-            full_prebuilt_lib_list += prebuilt_lib_list
+        full_prebuilt_lib_list += prebuilt_lib_list
     return full_prebuilt_lib_list
 
 
@@ -157,8 +163,7 @@ def eval_definitions_list_in_description(description, current_model, source_type
     full_definitions_list = []
     for attr_name in all_attr:
         definitions_list = getattr(description, attr_name)
-        if definitions_list is not None:
-            full_definitions_list += definitions_list
+        full_definitions_list += definitions_list
     return full_definitions_list
 
 

@@ -1,6 +1,6 @@
 from __future__ import print_function
 
-__all__ = ['create_toolset']
+__all__ = ['create_toolset', 'describe_toolset']
 
 import ctypes
 import os
@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 
+from .arch_parse import parse_arch_specific_tokens
 from .build_art import BuildArtifact
 from .constants import *
 from .depends_check import *
@@ -17,12 +18,7 @@ from .nasm_action import NasmSourceBuildAction
 from .os_utils import *
 from .string_utils import escape_string, argv_to_rsp
 from .toolset_base import ToolsetBase, ToolsetModel
-
-
-
-ARCH_FLAGS_MINGW_WIN32 = ['-m32']
-ARCH_FLAGS_MINGW_WIN64 = ['-m64']
-ARCH_FLAGS_X86_FROM_X86_64 = ['-m32']
+from .winapi_level import *
 
 
 GCC_MODEL_LINUX_X86 = 'gcc-linux-x86'
@@ -45,6 +41,13 @@ CROSSTOOL_MODEL_NAMES = {
     TAG_ARCH_X86_64: GCC_CROSSTOOL_MODEL_LINUX_X86_64,
     TAG_ARCH_ARM: GCC_CROSSTOOL_MODEL_LINUX_ARM,
     TAG_ARCH_ARM64: GCC_CROSSTOOL_MODEL_LINUX_ARM64,
+}
+
+LINUX_GCC_MODEL_NAMES = {
+    TAG_ARCH_X86: GCC_MODEL_LINUX_X86,
+    TAG_ARCH_X86_64: GCC_MODEL_LINUX_X86_64,
+    TAG_ARCH_ARM: GCC_MODEL_LINUX_ARM,
+    TAG_ARCH_ARM64: GCC_MODEL_LINUX_ARM64,
 }
 
 CROSSTOOL_NATIVE_STATUS = {
@@ -107,7 +110,8 @@ class SourceBuildActionGCC:
         self.deptmp_path = self.dep_path + 'tmp'
         self.project_root = sysinfo[TAG_CFG_DIR_PROJECT_ROOT]
         self.common_prefix = sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX]
-        self.arch_flags = build_model.get_arch_flags()
+        self.arch_flags = []
+        self.arch_flags += build_model.get_arch_compile_flags()
         self.symbol_visibility_default = description.symbol_visibility_default
         self.build_config = build_config
         self.include_dirs = eval_include_dirs_in_description(description, self.project_root, source_type)
@@ -299,7 +303,8 @@ class LinkActionGCC:
         self.module_name = description.module_name
         self.rsp_file = os.path.join(self.link_private_dir, '{}.rsplnk'.format(self.module_name))
         self.obj_list = []
-        self.arch_flags = build_model.get_arch_flags()
+        self.arch_flags = []
+        self.arch_flags += build_model.get_arch_link_flags()
         self.build_config = build_config
         for obj_name in obj_names:
             obj_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_OBJ_SUFFIX]]))
@@ -335,6 +340,9 @@ class LinkActionGCC:
 
         argv = [ self.tools.gpp ]
         argv += self.arch_flags
+
+        if self.tools.is_mingw:
+            argv += ['-Wl,--enable-stdcall-fixup']
 
         if self.is_dll:
             argv += ['-shared']
@@ -463,15 +471,16 @@ class LinkActionGCC:
 
 
 class GccModel(ToolsetModel):
-    def __init__(self, model_name, target_os, target_os_alias, arch_name, arch_flags, is_native):
+    def __init__(self, model_name, is_native, target_os, target_os_alias, arch_name, arch_flags, arch_link_flags):
         ToolsetModel.__init__(self)
 
         self._model_name = model_name
+        self._is_native = is_native
         self._target_os = target_os
         self._target_os_alias = target_os_alias
         self._arch_name = arch_name
-        self._arch_flags = arch_flags
-        self._is_native = is_native
+        self._arch_compile_flags = arch_flags
+        self._arch_link_flags = arch_link_flags
 
     @property
     def model_name(self):
@@ -492,9 +501,11 @@ class GccModel(ToolsetModel):
     def is_native(self):
         return self._is_native
 
-    def get_arch_flags(self):
-        return self._arch_flags
+    def get_arch_compile_flags(self):
+        return self._arch_compile_flags
 
+    def get_arch_link_flags(self):
+        return self._arch_link_flags
 
 
 class ToolsetGCC(ToolsetBase):
@@ -513,16 +524,38 @@ class ToolsetGCC(ToolsetBase):
             self._platform_name = TAG_PLATFORM_WINDOWS
 
             if TAG_ARCH_X86 in self._tools.arch_list:
+                winapi_level_x86 = self._tools.api_levels[TAG_ARCH_X86]
+                ntddi_level_x86 = IMPLIED_NTDDI_VALUES[winapi_level_x86]
+
+                mingw_x86_compile_flags = ['-m32',
+                    '-D_WIN32_WINNT={}'.format(winapi_level_x86),
+                    '-DWINVER={}'.format(winapi_level_x86),
+                    '-DNTDDI_VERSION={}'.format(ntddi_level_x86)]
+
+                mingw_x86_link_flags = ['-m32']
+
                 model_win32 = GccModel(
-                    model_name=GCC_MODEL_MINGW32, target_os=TAG_PLATFORM_WINDOWS, target_os_alias=None,
-                    arch_name=TAG_ARCH_X86, arch_flags=ARCH_FLAGS_MINGW_WIN32, is_native=is_windows_32bit())
+                    model_name=GCC_MODEL_MINGW32, is_native=is_windows_32bit(),
+                    target_os=TAG_PLATFORM_WINDOWS, target_os_alias=None, arch_name=TAG_ARCH_X86,
+                    arch_flags=mingw_x86_compile_flags, arch_link_flags=mingw_x86_link_flags)
 
                 models.append(model_win32)
 
             if TAG_ARCH_X86_64 in self._tools.arch_list:
+                winapi_level_x86_64 = self._tools.api_levels[TAG_ARCH_X86_64]
+                ntddi_level_x86_64 = IMPLIED_NTDDI_VALUES[winapi_level_x86_64]
+
+                mingw_x86_64_compile_flags = ['-m64',
+                    '-D_WIN32_WINNT={}'.format(winapi_level_x86_64),
+                    '-DWINVER={}'.format(winapi_level_x86_64),
+                    '-DNTDDI_VERSION={}'.format(ntddi_level_x86_64)]
+
+                mingw_x86_64_link_flags = ['-m64']
+
                 model_win64 = GccModel(
-                    model_name=GCC_MODEL_MINGW64, target_os=TAG_PLATFORM_WINDOWS, target_os_alias=None,
-                    arch_name=TAG_ARCH_X86_64, arch_flags=ARCH_FLAGS_MINGW_WIN64, is_native=is_windows_64bit())
+                    model_name=GCC_MODEL_MINGW64, is_native=is_windows_64bit(),
+                    target_os=TAG_PLATFORM_WINDOWS, target_os_alias=None, arch_name=TAG_ARCH_X86_64,
+                    arch_flags=mingw_x86_64_compile_flags, arch_link_flags=mingw_x86_64_link_flags)
 
                 models.append(model_win64)
 
@@ -534,8 +567,9 @@ class ToolsetGCC(ToolsetBase):
                 x_is_native = CROSSTOOL_NATIVE_STATUS[x_arch]
 
                 x_model = GccModel(
-                    model_name=x_model_name, target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX,
-                    arch_name=x_arch, arch_flags=[], is_native=x_is_native)
+                    model_name=x_model_name, is_native=x_is_native,
+                    target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=x_arch,
+                    arch_flags=[], arch_link_flags=[])
 
                 models.append(x_model)
 
@@ -544,12 +578,14 @@ class ToolsetGCC(ToolsetBase):
                 self._platform_name = TAG_PLATFORM_LINUX
 
                 model_linux_x86 = GccModel(
-                    model_name=GCC_MODEL_LINUX_X86, target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX,
-                    arch_name=TAG_ARCH_X86, arch_flags=ARCH_FLAGS_X86_FROM_X86_64, is_native=False)
+                    model_name=GCC_MODEL_LINUX_X86, is_native=False,
+                    target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86,
+                    arch_flags=['-m32'], arch_link_flags=['-m32'])
 
                 model_linux_x86_64 = GccModel(
-                    model_name=GCC_MODEL_LINUX_X86_64, target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX,
-                    arch_name=TAG_ARCH_X86_64, arch_flags=[], is_native=True)
+                    model_name=GCC_MODEL_LINUX_X86_64, is_native=True,
+                    target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86_64,
+                    arch_flags=[], arch_link_flags=[])
 
                 models.extend([model_linux_x86, model_linux_x86_64])
 
@@ -557,8 +593,9 @@ class ToolsetGCC(ToolsetBase):
                 self._platform_name = TAG_PLATFORM_LINUX
 
                 model_linux_x86 = GccModel(
-                    model_name=GCC_MODEL_LINUX_X86, target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX,
-                    arch_name=TAG_ARCH_X86, arch_flags=[], is_native=True)
+                    model_name=GCC_MODEL_LINUX_X86, is_native=True,
+                    target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86,
+                    arch_flags=[], arch_link_flags=[])
 
                 models.append(model_linux_x86)
 
@@ -566,8 +603,9 @@ class ToolsetGCC(ToolsetBase):
                 self._platform_name = TAG_PLATFORM_LINUX
 
                 model_linux_arm = GccModel(
-                    model_name=GCC_MODEL_LINUX_ARM, target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX,
-                    arch_name=TAG_ARCH_ARM, arch_flags=[], is_native=True)
+                    model_name=GCC_MODEL_LINUX_ARM, is_native=True,
+                    target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_ARM,
+                    arch_flags=[], arch_link_flags=[])
 
                 models.append(model_linux_arm)
 
@@ -575,8 +613,9 @@ class ToolsetGCC(ToolsetBase):
                 self._platform_name = TAG_PLATFORM_LINUX
 
                 model_linux_arm = GccModel(
-                    model_name=GCC_MODEL_LINUX_ARM64, target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX,
-                    arch_name=TAG_ARCH_ARM64, arch_flags=[], is_native=True)
+                    model_name=GCC_MODEL_LINUX_ARM64, is_native=True,
+                    target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_ARM64,
+                    arch_flags=[], arch_link_flags=[])
 
                 models.append(model_linux_arm)
 
@@ -585,8 +624,9 @@ class ToolsetGCC(ToolsetBase):
                     self._platform_name = TAG_PLATFORM_MACOSX
 
                     model_macosx_x86_64 = GccModel(
-                        model_name=CLANG_MODEL_MACOSX_X86_64, target_os=TAG_PLATFORM_MACOSX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX,
-                        arch_name=TAG_ARCH_X86_64, arch_flags=[], is_native=True)
+                        model_name=CLANG_MODEL_MACOSX_X86_64, is_native=True,
+                        target_os=TAG_PLATFORM_MACOSX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86_64,
+                        arch_flags=[], arch_link_flags=[])
 
                     models.append(model_macosx_x86_64)
 
@@ -647,7 +687,7 @@ class ToolsetGCC(ToolsetBase):
 
 
 class ToolsInfoGCC:
-    def __init__(self, dir_prefix=None, bin_prefix=None, is_mingw=None, is_clang=None, is_crosstool=None, arch_list=None, nasm=None):
+    def __init__(self, dir_prefix=None, bin_prefix=None, is_mingw=None, is_clang=None, is_crosstool=None, arch_list=None, nasm=None, api_levels=None):
         tool_gcc = 'clang' if is_clang else 'gcc'
         tool_gpp = 'clang' if is_clang else 'g++'
         tool_ar  = 'libtool' if is_clang else 'ar'
@@ -666,6 +706,7 @@ class ToolsInfoGCC:
         self.is_clang = is_clang
         self.is_crosstool = is_crosstool
         self.arch_list = arch_list
+        self.api_levels = api_levels
 
         self.gcc = tool_gcc
         self.gpp = tool_gpp
@@ -675,6 +716,7 @@ class ToolsInfoGCC:
 
         if is_mingw:
             self.nasm_enabled = True
+
         elif is_crosstool:
             self.nasm_enabled = False
             if arch_list:
@@ -701,10 +743,26 @@ def init_mingw_tools(sysinfo, mingw, nasm):
     arch_list = mingw.get('arch')
     if not isinstance(arch_list, list) or not arch_list:
         raise BuildSystemException("Malformed MinGW config: 'arch' list is not given or empty in project config file.")
+    arch_parsed = []
+    api_levels = {}
     for arch in arch_list:
-        if arch not in TAG_ALL_KNOWN_MINGW_ARCH_LIST:
-            raise BuildSystemException("Malformed cross-tools config: unknown arch value '{}' given. The following are supported: {}.".format(arch, ', '.join(TAG_ALL_KNOWN_MINGW_ARCH_LIST)))
-    tools = ToolsInfoGCC(dir_prefix=package_path_bin, bin_prefix=bin_prefix, is_mingw=True, arch_list=arch_list, nasm=nasm)
+        winapi_level = None
+        if ':' in arch:
+            arch_value, winapi_level = arch.split(':', 1)
+            winapi_level = winapi_level.strip()
+        else:
+            arch_value = arch
+        if arch_value not in TAG_ALL_KNOWN_MINGW_ARCH_LIST:
+            raise BuildSystemException("Malformed MinGW config: unknown arch value '{}' is given. Only the following values are supported: {}.".format(arch_value, ', '.join(TAG_ALL_KNOWN_MINGW_ARCH_LIST)))
+        if not winapi_level:
+            winapi_level = WINDOWS_API_DEFAULT_LEVEL[arch]
+        else:
+            if winapi_level not in WINDOWS_API_LEVELS:
+                raise BuildSystemException("Malformed MinGW config: unknown Windows API level '{}' is given. Only the following values are supported: {}.".format(winapi_level, ', '.join(WINDOWS_API_LEVELS)))
+        arch_parsed.append(arch_value)
+        api_levels[arch_value] = winapi_level
+
+    tools = ToolsInfoGCC(dir_prefix=package_path_bin, bin_prefix=bin_prefix, is_mingw=True, arch_list=arch_parsed, nasm=nasm, api_levels=api_levels)
     return tools
 
 
@@ -727,7 +785,7 @@ def init_cross_tools(sysinfo, xtools_cfg, nasm):
 
     for arch in cross_arch_list:
         if arch not in TAG_ALL_KNOWN_ARCH_LIST:
-            raise BuildSystemException("Malformed cross-tools config: unknown arch value '{}' given. The following are supported: {}.".format(arch, ', '.join(TAG_ALL_KNOWN_ARCH_LIST)))
+            raise BuildSystemException("Malformed cross-tools config: unknown arch value '{}' is given. The following are supported: {}.".format(arch, ', '.join(TAG_ALL_KNOWN_ARCH_LIST)))
 
     bin_prefix = xtools_cfg.get('prefix')
     tools = ToolsInfoGCC(dir_prefix=package_path_bin, bin_prefix=bin_prefix, is_crosstool=True, arch_list=cross_arch_list, nasm=nasm)
@@ -748,6 +806,123 @@ def create_toolset(sysinfo, loader, **kwargs):
 
     gcc_tools = ToolsInfoGCC(nasm=nasm_executable)
     return ToolsetGCC('gcc', gcc_tools, sysinfo, loader)
+
+
+def _describe_toolset_imp(native_id, config_proto, pragma_line, sys_platform, sys_arch, **kwargs):
+    nasm_executable = kwargs.get('nasm_executable')
+    toolset_id = None
+    config_parts = []
+    conflicts = None
+    models_per_arch = {}
+    if 'mingw' in kwargs:
+        mingw_parts = []
+        mingw = kwargs['mingw']
+        mingw_package = mingw.get('package')
+        mingw_prefix = mingw.get('prefix')
+        if mingw_package:
+            if not os.path.isdir(os.path.expanduser(mingw_package)):
+                raise BuildSystemException("Can't process makefile: '{}', line: {}, MinGW 'package' directory not found: '{}'.".format(config_proto, pragma_line, mingw_package))
+            mingw_parts += ["'package_path':'{}'".format(escape_string(mingw_package))]
+        if mingw_prefix:
+            mingw_parts += ["'prefix':'{}'".format(mingw_prefix)]
+        mingw_arch = mingw.get('arch')
+        if not mingw_arch:
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, MinGW 'arch' list is not given or empty.".format(config_proto, pragma_line))
+        mingw_arch_list, winapi_levels = parse_arch_specific_tokens(mingw_arch, arch_supported=[TAG_ARCH_X86, TAG_ARCH_X86_64], allow_empty_tokens=True, supported_tokens=WINDOWS_API_LEVELS)
+        if mingw_arch_list is None or (TAG_ARCH_X86 not in mingw_arch_list and TAG_ARCH_X86_64 not in mingw_arch_list):
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, token 'arch' is malformed: '{}'".format(config_proto, pragma_line, mingw_arch))
+        win32_api_level = None
+        win64_api_level = None
+        if TAG_ARCH_X86 in winapi_levels:
+            if winapi_levels[TAG_ARCH_X86]:
+                win32_api_level = winapi_levels[TAG_ARCH_X86]
+        if TAG_ARCH_X86_64 in winapi_levels:
+            if winapi_levels[TAG_ARCH_X86_64]:
+                win64_api_level = winapi_levels[TAG_ARCH_X86_64]
+        if not win32_api_level:
+            win32_api_level = WINDOWS_API_DEFAULT_LEVEL[TAG_ARCH_X86]
+        if not win64_api_level:
+            win64_api_level = WINDOWS_API_DEFAULT_LEVEL[TAG_ARCH_X86_64]
+
+        if TAG_ARCH_X86 in mingw_arch_list and TAG_ARCH_X86_64 in mingw_arch_list:
+            toolset_id = 'mingw-multiarch'
+            mingw_parts += [ "'arch':['{}:{}','{}:{}']".format(TAG_ARCH_X86, win32_api_level, TAG_ARCH_X86_64, win64_api_level) ]
+            conflicts = ['mingw-{}'.format(TAG_ARCH_X86), 'mingw-{}'.format(TAG_ARCH_X86_64)]
+            models_per_arch[TAG_ARCH_X86] = GCC_MODEL_MINGW32
+            models_per_arch[TAG_ARCH_X86_64] = GCC_MODEL_MINGW64
+
+        elif TAG_ARCH_X86 in mingw_arch_list:
+            toolset_id = 'mingw-{}'.format(TAG_ARCH_X86)
+            mingw_parts += [ "'arch':['{}:{}']".format(TAG_ARCH_X86, win32_api_level) ]
+            conflicts = ['mingw-multiarch']
+            models_per_arch[TAG_ARCH_X86] = GCC_MODEL_MINGW32
+
+        elif TAG_ARCH_X86_64 in mingw_arch_list:
+            toolset_id = 'mingw-{}'.format(TAG_ARCH_X86_64)
+            mingw_parts += [ "'arch':['{}:{}']".format(TAG_ARCH_X86_64, win64_api_level) ]
+            conflicts = ['mingw-multiarch']
+            models_per_arch[TAG_ARCH_X86_64] = GCC_MODEL_MINGW64
+
+        config_parts += ["'mingw':{{{}}}".format(','.join(mingw_parts))]
+
+    elif 'xtools' in kwargs:
+        xtools_parts = []
+        xtools = kwargs['xtools']
+        xtools_package = xtools.get('package')
+        xtools_prefix = xtools.get('prefix')
+        if not xtools_package:
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'package' directory is not given.".format(config_proto, pragma_line))
+        if not os.path.isdir(os.path.expanduser(xtools_package)):
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'package' directory not found: '{}'.".format(config_proto, pragma_line, xtools_package))
+        xtools_parts += ["'package_path':'{}'".format(escape_string(xtools_package))]
+        if xtools_prefix:
+            xtools_parts += ["'prefix':'{}'".format(xtools_prefix)]
+        xtools_arch = xtools.get('arch')
+        if not xtools_arch:
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'arch' list is not given or empty.".format(config_proto, pragma_line))
+        xtools_arch_list, _ = parse_arch_specific_tokens(xtools_arch, arch_supported=TAG_ALL_KNOWN_ARCH_LIST, allow_empty_tokens=True)
+        if not xtools_arch_list:
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, token 'arch' is malformed: '{}'".format(config_proto, pragma_line, xtools_arch))
+        xtools_parts += ["'arch':['{}']".format("','".join(xtools_arch_list))]
+
+        toolset_id = 'xtools-{}'.format('-'.join(sorted(xtools_arch_list)))
+        config_parts += ["'x-tools':{{{}}}".format(','.join(xtools_parts))]
+
+        for arch in xtools_arch_list:
+            models_per_arch[arch] = CROSSTOOL_MODEL_NAMES[arch]
+
+    else:
+        toolset_id = '{}-native'.format(native_id)
+        if sys_platform == TAG_PLATFORM_LINUX:
+            if native_id == 'gcc':
+                models_per_arch[sys_arch] = LINUX_GCC_MODEL_NAMES[sys_arch]
+                if sys_arch == TAG_ARCH_X86_64:
+                    models_per_arch[TAG_ARCH_X86] = LINUX_GCC_MODEL_NAMES[TAG_ARCH_X86]
+
+        elif sys_platform == TAG_PLATFORM_MACOSX:
+            if native_id == 'clang' and sys_arch == TAG_ARCH_X86_64:
+                models_per_arch[TAG_ARCH_X86_64] = CLANG_MODEL_MACOSX_X86_64
+
+    if nasm_executable:
+        config_parts += ["'nasm_executable':'{0}'".format(escape_string(nasm_executable))]
+
+    description_lines = [
+        "[{}]".format(toolset_id),
+        "{} = {}".format(TAG_INI_TOOLSET_MODULE, native_id),
+    ]
+
+    if config_parts:
+        description_lines += [ "{} = {{{}}}".format(TAG_INI_TOOLSET_CONFIG, ','.join(config_parts)) ]
+
+    return toolset_id, description_lines, conflicts, models_per_arch
+
+
+def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs):
+    return _describe_toolset_imp('gcc', config_proto, pragma_line, sys_platform, sys_arch, **kwargs)
+
+
+def _describe_clang_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs):
+    return _describe_toolset_imp('clang', config_proto, pragma_line, sys_platform, sys_arch, **kwargs)
 
 
 def _create_clang_toolset(sysinfo, loader, **kwargs):

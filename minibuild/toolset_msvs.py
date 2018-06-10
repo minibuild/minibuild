@@ -1,7 +1,10 @@
 from __future__ import print_function
 
-__all__ = ['create_toolset']
+__all__ = ['create_toolset', 'describe_toolset']
 
+import ctypes
+import ctypes.wintypes
+import json
 import os
 import os.path
 import shutil
@@ -13,6 +16,7 @@ if sys.version_info.major < 3:
 else:
     import winreg
 
+from .arch_parse import parse_arch_specific_tokens
 from .build_art import BuildArtifact
 from .constants import *
 from .depends_check import *
@@ -21,14 +25,8 @@ from .nasm_action import NasmSourceBuildAction
 from .os_utils import *
 from .string_utils import escape_string, argv_to_rsp
 from .toolset_base import ToolsetBase, ToolsetModel
+from .winapi_level import *
 
-
-MSVS_VERSIONS_MAPPING = {
-    '2005' : 'VS80COMNTOOLS',
-    '2008' : 'VS90COMNTOOLS',
-    '2013' : 'VS120COMNTOOLS',
-    '2015' : 'VS140COMNTOOLS',
-}
 
 WINDOWS_SDKS_REG_LANDMARK = 'SOFTWARE\\Microsoft\\Microsoft SDKs\\Windows'
 
@@ -46,7 +44,7 @@ MSVS_DEP_MARK = 'Note: including file:'
 MSVS_DEP_MARK_LEN = len(MSVS_DEP_MARK)
 
 ENV_DUMP_BATCH = '''@echo off
-call "{0}" 1>nul 2>nul
+call {0} 1>nul 2>nul
 if errorlevel 0 set
 '''
 
@@ -55,6 +53,84 @@ TAG_MSVS_MT   = 'mt'
 TAG_MSVS_LIB  = 'lib'
 TAG_MSVS_LINK = 'link'
 TAG_MSVS_ASM  = 'ml'
+
+
+def program_files_x86_path():
+    is_on_win64 = is_windows_64bit()
+    csidl = 0x002a if is_on_win64 else 0x0026
+    path = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+    hres = ctypes.windll.shell32.SHGetFolderPathW(
+        ctypes.c_void_p(),
+        ctypes.c_int(csidl),
+        ctypes.c_void_p(),
+        ctypes.c_ulong(0),
+        ctypes.byref(path))
+    if hres != 0:
+        raise ctypes.WinError(hres)
+    return path.value
+
+
+def vswhere_get_installation_path(version_query):
+    vswhere_path = os.path.normpath(os.path.join(program_files_x86_path(), 'Microsoft Visual Studio/Installer/vswhere.exe'))
+    if os.path.isfile(vswhere_path):
+        argv = [vswhere_path,'-version', version_query, '-products', '*', '-format', 'json', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath']
+        install_path_text = subprocess.check_output(argv, universal_newlines=True).rstrip('\r\n').strip()
+        install_path_info = json.loads(install_path_text)
+        if isinstance(install_path_info, list) and install_path_info:
+            if isinstance(install_path_info[0], dict) and 'installationPath' in install_path_info[0]:
+                installation_path = install_path_info[0]['installationPath']
+                if installation_path and os.path.isdir(installation_path):
+                    return installation_path
+    return None
+
+
+def _env_test(env_var):
+    value = os.environ.get(env_var)
+    return True if value else False
+
+
+def _env_batch32(msvs_version, env_var):
+    msvs_vars_dir = os.environ.get(env_var)
+    if msvs_vars_dir is None:
+        raise BuildSystemException("Cannot bootstrap MSVS({}): variable '{}' not found in environment.".format(msvs_version, env_var))
+    msvs_vars_batch32 = os.path.join(msvs_vars_dir, 'vsvars32.bat')
+    if not os.path.isfile(msvs_vars_batch32):
+        raise BuildSystemException("Cannot bootstrap MSVS({}): file '{}' not found.".format(msvs_version, msvs_vars_batch32))
+    return msvs_vars_batch32, None
+
+
+def _vswhere_test(version_query):
+    installation_path = vswhere_get_installation_path(version_query)
+    return True if installation_path else False
+
+
+def vswhere_batch(msvs_version, version_query, arch_flag):
+    is_on_win64 = is_windows_64bit()
+    host_arch_flag = '-host_arch=x64' if is_on_win64 else '-host_arch=x86'
+    installation_path = vswhere_get_installation_path(version_query)
+    msvs_vars_batch = os.path.normpath(os.path.join(installation_path, 'Common7/Tools/vsdevcmd.bat'))
+    if not os.path.isfile(msvs_vars_batch):
+        raise BuildSystemException("Cannot bootstrap MSVS({}): file '{}' not found.".format(msvs_version, msvs_vars_batch))
+    return msvs_vars_batch, [arch_flag, host_arch_flag]
+
+
+def _vswhere_batch32(msvs_version, version_query):
+    return vswhere_batch(msvs_version, version_query, '-arch=x86')
+
+
+def _vswhere_batch64(msvs_version, version_query):
+    return vswhere_batch(msvs_version, version_query, '-arch=x64')
+
+
+MSVS_VERSIONS_MAPPING = (
+    ['2005', ('VS80COMNTOOLS',),   _env_test,      _env_batch32,     None             ],
+    ['2008', ('VS90COMNTOOLS',),   _env_test,      _env_batch32,     None             ],
+    ['2010', ('VS100COMNTOOLS',),  _env_test,      _env_batch32,     None             ],
+    ['2012', ('VS110COMNTOOLS',),  _env_test,      _env_batch32,     None             ],
+    ['2013', ('VS120COMNTOOLS',),  _env_test,      _env_batch32,     None             ],
+    ['2015', ('VS140COMNTOOLS',),  _env_test,      _env_batch32,     None             ],
+    ['2017', ('[15.0,16.0)',),     _vswhere_test,  _vswhere_batch32, _vswhere_batch64 ],
+)
 
 
 def query_windows_sdk_path():
@@ -222,6 +298,8 @@ def get_cl_and_envmap_from_dump(msvs_version, env_dump):
     cl_path = None
     for env_entry in env_dump.splitlines():
         var_name, var_value = env_entry.split('=', 1)
+        if var_name.upper() == '__VSCMD_PREINIT_PATH':
+            continue
         is_path = var_name.upper() == 'PATH'
         if not is_path and var_name in os.environ:
             continue
@@ -268,33 +346,42 @@ def init_msvs_toolset(msvs_version, bootstrap_dir):
         tools32, tools64 = map_msvs_tools_info(sdk_path, cl_path32, cl_path64, is_on_win64, msvs_version)
         return tools32, env_patch32, tools64, env_patch64
 
-    msvs_landmark = MSVS_VERSIONS_MAPPING.get(msvs_version)
-    if msvs_landmark is None:
+    msvs_vars_batch32 = None
+    msvs_vars_batch32_argv = None
+    msvs_vars_batch64 = None
+    msvs_vars_batch64_argv = None
+    for probe_info in MSVS_VERSIONS_MAPPING:
+        if probe_info[0] == msvs_version:
+            probe_args = probe_info[1]
+            probe_batch32 = probe_info[3]
+            probe_batch64 = probe_info[4]
+            msvs_vars_batch32, msvs_vars_batch32_argv = probe_batch32(probe_info[0], *probe_args)
+            if probe_batch64 is not None:
+                msvs_vars_batch64, msvs_vars_batch64_argv = probe_batch64(probe_info[0], *probe_args)
+            break
+    else:
         raise BuildSystemException("Unknown MSVS version: '{}'.".format(msvs_version))
-    msvs_vars_dir = os.environ.get(msvs_landmark)
-    if msvs_vars_dir is None:
-        raise BuildSystemException("Cannot bootstrap MSVS({}): variable '{}' not found in environment.".format(msvs_version, msvs_landmark))
-    msvs_vars_batch32 = os.path.join(msvs_vars_dir, 'vsvars32.bat')
-    if not os.path.exists(msvs_vars_batch32):
-        raise BuildSystemException("Cannot bootstrap MSVS({}): file '{}' not found.".format(msvs_version, msvs_vars_batch32))
+
     mkdir_safe(cache_dir)
     msvs_vars_wrapper32 = os.path.join(cache_dir, 'vars_dump32.bat')
     with open(msvs_vars_wrapper32, mode='wt') as wrapper_file32:
-        wrapper_file32.write(ENV_DUMP_BATCH.format(msvs_vars_batch32))
+        msvs_vars_batch32_args_fmt = ['"{}"'.format(msvs_vars_batch32)]
+        if msvs_vars_batch32_argv:
+            msvs_vars_batch32_args_fmt.extend(msvs_vars_batch32_argv)
+        wrapper_file32.write(ENV_DUMP_BATCH.format(' '.join(msvs_vars_batch32_args_fmt)))
     env_dump32 = subprocess.check_output(msvs_vars_wrapper32, shell=True, universal_newlines=True)
     cl_path32, env_map32 = get_cl_and_envmap_from_dump(msvs_version, env_dump32)
 
-    cl_home = os.path.dirname(cl_path32)
-    if is_on_win64:
-        msvs_vars_batch64_variants = [ os.path.join(cl_home, 'amd64', 'vcvarsamd64.bat'), os.path.join(cl_home, 'amd64', 'vcvars64.bat') ]
-    else:
-        msvs_vars_batch64_variants = [ os.path.join(cl_home, 'x86_amd64', 'vcvarsx86_amd64.bat') ]
-
-    msvs_vars_batch64 = None
-    for batch64 in msvs_vars_batch64_variants:
-        if os.path.isfile(batch64):
-            msvs_vars_batch64 = batch64
-            break
+    if msvs_vars_batch64 is None:
+        cl_home = os.path.dirname(cl_path32)
+        if is_on_win64:
+            msvs_vars_batch64_variants = [ os.path.join(cl_home, 'amd64', 'vcvarsamd64.bat'), os.path.join(cl_home, 'amd64', 'vcvars64.bat') ]
+        else:
+            msvs_vars_batch64_variants = [ os.path.join(cl_home, 'x86_amd64', 'vcvarsx86_amd64.bat') ]
+        for batch64 in msvs_vars_batch64_variants:
+            if os.path.isfile(batch64):
+                msvs_vars_batch64 = batch64
+                break
 
     if msvs_vars_batch64 is None:
         if len(msvs_vars_batch64_variants) == 1:
@@ -304,7 +391,10 @@ def init_msvs_toolset(msvs_version, bootstrap_dir):
 
     msvs_vars_wrapper64 = os.path.join(cache_dir, 'vars_dump64.bat')
     with open(msvs_vars_wrapper64, mode='wt') as wrapper_file64:
-        wrapper_file64.write(ENV_DUMP_BATCH.format(msvs_vars_batch64))
+        msvs_vars_batch64_args_fmt = ['"{}"'.format(msvs_vars_batch64)]
+        if msvs_vars_batch64_argv:
+            msvs_vars_batch64_args_fmt.extend(msvs_vars_batch64_argv)
+        wrapper_file64.write(ENV_DUMP_BATCH.format(' '.join(msvs_vars_batch64_args_fmt)))
     env_dump64 = subprocess.check_output(msvs_vars_wrapper64, shell=True, universal_newlines=True)
     cl_path64, env_map64 = get_cl_and_envmap_from_dump(msvs_version, env_dump64)
 
@@ -420,7 +510,8 @@ class SourceBuildActionMSVS:
         self.common_prefix = sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX]
         self.build_config = build_config
         self.include_dirs = eval_include_dirs_in_description(description, self.project_root, source_type)
-        self.definitions  = build_model.get_arch_defines()
+        self.definitions = []
+        self.definitions += build_model.get_arch_defines()
         self.definitions += eval_definitions_list_in_description(description, build_model, source_type)
         self.disabled_warnings = []
         if description.disabled_warnings:
@@ -611,7 +702,8 @@ class LinkActionMSVS:
         self.link_libshared_names = []
         eval_libnames_in_description(loader, description, self.link_libstatic_names, self.link_libshared_names)
         self.prebuilt_lib_names = eval_prebuilt_lib_list_in_description(description, build_model)
-        self.linker_options = build_model.get_linker_options()
+        self.linker_options = []
+        self.linker_options += build_model.get_linker_options()
 
     def __call__(self, force, verbose):
         mod_type_id = BUILD_RET_TYPE_DLL if self.is_dll else BUILD_RET_TYPE_EXE
@@ -727,11 +819,21 @@ class LinkActionMSVS:
         return (True, build_result)
 
 
+def _winapi_level_to_compiler_defines(api_level):
+    ntddi_level = IMPLIED_NTDDI_VALUES[api_level]
+    return [
+        '_WIN32_WINNT={}'.format(api_level),
+        'WINVER={}'.format(api_level),
+        'NTDDI_VERSION={}'.format(ntddi_level),
+    ]
+
+
 class MsvsModelWin32(ToolsetModel):
-    def __init__(self, msvs_version):
+    def __init__(self, msvs_version, api_level):
         ToolsetModel.__init__(self)
         self._name = MSVS_MODEL_FORMAT_WIN32.format(msvs_version)
         self._is_native = is_windows_32bit()
+        self._arch_defines = _winapi_level_to_compiler_defines(api_level)
 
     @property
     def model_name(self):
@@ -753,17 +855,18 @@ class MsvsModelWin32(ToolsetModel):
         return self._is_native
 
     def get_arch_defines(self):
-        return [ '_WIN32_WINNT=0x0501', 'WINVER=0x0501']
+        return self._arch_defines
 
     def get_linker_options(self):
-        return [ '/MACHINE:X86']
+        return ['/MACHINE:X86']
 
 
 class MsvsModelWin64(ToolsetModel):
-    def __init__(self, msvs_version):
+    def __init__(self, msvs_version, api_level):
         ToolsetModel.__init__(self)
         self._name = MSVS_MODEL_FORMAT_WIN64.format(msvs_version)
         self._is_native = is_windows_64bit()
+        self._arch_defines = _winapi_level_to_compiler_defines(api_level)
 
     @property
     def model_name(self):
@@ -785,24 +888,28 @@ class MsvsModelWin64(ToolsetModel):
         return self._is_native
 
     def get_arch_defines(self):
-        return [ '_WIN32_WINNT=0x0502', 'WINVER=0x0502']
+        return self._arch_defines
 
     def get_linker_options(self):
-        return [ '/MACHINE:X64']
+        return ['/MACHINE:X64']
 
 
 class ToolsetMSVS(ToolsetBase):
-    def __init__(self, msvs_version, sysinfo, loader, tools_path32, custom_env32, tools_path64, custom_env64, nasm_executable):
+    def __init__(self, msvs_version, sysinfo, loader, nasm_executable,
+                tools_path32, custom_env32, win32_api_level,
+                tools_path64, custom_env64, win64_api_level):
         ToolsetBase.__init__(self)
         self._msvs_version = msvs_version
         self._sysinfo = sysinfo
         self._loader = loader
-        self._tools_path32 = tools_path32
-        self._custom_env32 = custom_env32
-        self._tools_path64 = tools_path64
-        self._custom_env64 = custom_env64
         self._nasm_executable = nasm_executable
         self._nasm_checked = False
+        self._tools_path32 = tools_path32
+        self._custom_env32 = custom_env32
+        self._win32_api_level = win32_api_level
+        self._tools_path64 = tools_path64
+        self._custom_env64 = custom_env64
+        self._win64_api_level = win64_api_level
 
     @property
     def toolset_name(self):
@@ -814,8 +921,8 @@ class ToolsetMSVS(ToolsetBase):
 
     @property
     def supported_models(self):
-        model_win32 = MsvsModelWin32(self._msvs_version)
-        model_win64 = MsvsModelWin64(self._msvs_version)
+        model_win32 = MsvsModelWin32(self._msvs_version, self._win32_api_level)
+        model_win64 = MsvsModelWin64(self._msvs_version, self._win64_api_level)
         models = {
             model_win32.model_name : model_win32,
             model_win64.model_name : model_win64,
@@ -889,9 +996,96 @@ class ToolsetMSVS(ToolsetBase):
 
 def create_toolset(sysinfo, loader, **kwargs):
     msvs_version = kwargs['msvs_version']
-    nasm_executable = kwargs.get('nasm_executable', 'nasm')
     bootstrap_dir = sysinfo[TAG_CFG_DIR_BOOTSTRAP]
     tools_path32, env_patch32, tools_path64, env_patch64 = init_msvs_toolset(msvs_version, bootstrap_dir)
     custom_env32 = apply_environ_patch(env_patch32)
     custom_env64 = apply_environ_patch(env_patch64)
-    return ToolsetMSVS(msvs_version, sysinfo, loader, tools_path32, custom_env32, tools_path64, custom_env64, nasm_executable)
+
+    nasm_executable = kwargs.get('nasm_executable', 'nasm')
+    api_levels = kwargs.get('winapi', {})
+    win32_api_level = None
+    win64_api_level = None
+    for arch in api_levels:
+        if arch == TAG_ARCH_X86:
+            win32_api_level = api_levels[arch]
+        elif arch == TAG_ARCH_X86_64:
+            win64_api_level = api_levels[arch]
+        else:
+            raise BuildSystemException("Malformed MSVS({}) config: unknown arch value '{}' is given. The following are supported: {}.".format(msvs_version, arch, ', '.join([TAG_ARCH_X86, TAG_ARCH_X86_64])))
+    for winapi_level in (win32_api_level, win64_api_level):
+        if winapi_level and winapi_level not in WINDOWS_API_LEVELS:
+            raise BuildSystemException("Malformed MSVS({}) config: unknown Windows API level '{}' is given. Only the following values are supported: {}.".format(msvs_version, winapi_level, ', '.join(WINDOWS_API_LEVELS)))
+    if not win32_api_level:
+        win32_api_level = WINDOWS_API_DEFAULT_LEVEL[TAG_ARCH_X86]
+    if not win64_api_level:
+        win64_api_level = WINDOWS_API_DEFAULT_LEVEL[TAG_ARCH_X86_64]
+
+    toolset = ToolsetMSVS(msvs_version=msvs_version, sysinfo=sysinfo, loader=loader, nasm_executable=nasm_executable,
+        tools_path32=tools_path32, custom_env32=custom_env32, win32_api_level=win32_api_level,
+        tools_path64=tools_path64, custom_env64=custom_env64, win64_api_level=win64_api_level)
+
+    return toolset
+
+
+def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs):
+    version = kwargs.get('version')
+    nasm_executable = kwargs.get('nasm_executable')
+    arch = kwargs.get('arch')
+    if not version:
+        raise BuildSystemException("Can't process makefile: '{}', line: {}\n  MSVS version is not specified.".format(config_proto, pragma_line))
+    msvs_version = None
+    supported = []
+    if version == 'latest':
+        for probe_info in reversed(MSVS_VERSIONS_MAPPING):
+            version_title = probe_info[0]
+            probe_args = probe_info[1]
+            probe = probe_info[2]
+            supported.append(version_title)
+            detected = probe(*probe_args)
+            if detected:
+                msvs_version = version_title
+                break
+        if msvs_version is None:
+            raise BuildSystemException("Can't process makefile: '{}', line: {}\n  Can't find any supported version of MSVS toolset on this machine, tried: {}".format(config_proto, pragma_line, ','.join(supported)))
+    else:
+        for probe_info in MSVS_VERSIONS_MAPPING:
+            version_title = probe_info[0]
+            supported.append(version_title)
+            if version_title == version:
+                msvs_version = version_title
+                break
+        if msvs_version is None:
+            raise BuildSystemException("Can't process makefile: '{}', line: {}\n  Requested MSVS version: '{}' is not in list of supported versions: {}".format(config_proto, pragma_line, version, ','.join(supported)))
+    win32_api_level = None
+    win64_api_level = None
+    if arch:
+        arch_list, api_levels = parse_arch_specific_tokens(arch, arch_supported=[TAG_ARCH_X86, TAG_ARCH_X86_64], allow_empty_tokens=True, supported_tokens=WINDOWS_API_LEVELS)
+        if arch_list is None or (TAG_ARCH_X86 not in arch_list and TAG_ARCH_X86_64 not in arch_list):
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, token 'arch' is malformed: '{}'".format(config_proto, pragma_line, arch))
+        if TAG_ARCH_X86 in api_levels:
+            if api_levels[TAG_ARCH_X86]:
+                win32_api_level = api_levels[TAG_ARCH_X86]
+        if TAG_ARCH_X86_64 in api_levels:
+            if api_levels[TAG_ARCH_X86_64]:
+                win64_api_level = api_levels[TAG_ARCH_X86_64]
+    if not win32_api_level:
+        win32_api_level = WINDOWS_API_DEFAULT_LEVEL[TAG_ARCH_X86]
+    if not win64_api_level:
+        win64_api_level = WINDOWS_API_DEFAULT_LEVEL[TAG_ARCH_X86_64]
+
+    toolset_id = 'msvs-{}'.format(msvs_version)
+    config_parts = ["'msvs_version':'{}'".format(msvs_version), "'winapi':{{'{}':'{}','{}':'{}'}}".format(TAG_ARCH_X86, win32_api_level, TAG_ARCH_X86_64, win64_api_level)]
+    if nasm_executable:
+        config_parts += ["'nasm_executable':'{0}'".format(escape_string(nasm_executable))]
+    description_lines = [
+        "[{}]".format(toolset_id),
+        "{} = msvs".format(TAG_INI_TOOLSET_MODULE),
+        "{} = {{{}}}".format(TAG_INI_TOOLSET_CONFIG, ','.join(config_parts))
+    ]
+
+    models_per_arch = {
+        TAG_ARCH_X86 : MSVS_MODEL_FORMAT_WIN32.format(msvs_version),
+        TAG_ARCH_X86_64 : MSVS_MODEL_FORMAT_WIN64.format(msvs_version),
+    }
+
+    return toolset_id, description_lines, None, models_per_arch

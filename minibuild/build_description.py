@@ -1,5 +1,8 @@
+import linecache
 import os.path
 import re
+import sys
+import traceback
 
 from .constants import *
 from .error_utils import BuildSystemException
@@ -10,6 +13,117 @@ from .string_utils import is_string_instance
 
 _RE_INC = re.compile(r'^#include\s+"([\S]+)"\s*$')
 _RE_IMP = re.compile(r'^#import\s+"([\S]+)"\s*$')
+
+_RE_PRAGMA_BUILD = re.compile(r'^#pragma\s+build\b(.*)$')
+
+if sys.version_info.major < 3:
+    _CO_FUTURE_DIVISION         = 0x02000  # division
+    _CO_FUTURE_ABSOLUTE_IMPORT  = 0x04000  # perform absolute imports by default
+    _CO_FUTURE_WITH_STATEMENT   = 0x08000  # with statement
+    _CO_FUTURE_PRINT_FUNCTION   = 0x10000  # print function
+
+    _COMPILE_FLAGS = _CO_FUTURE_DIVISION | _CO_FUTURE_ABSOLUTE_IMPORT | _CO_FUTURE_WITH_STATEMENT | _CO_FUTURE_PRINT_FUNCTION
+else:
+    _COMPILE_FLAGS = 0
+
+
+def _parse_traceback_of_file(etype, value, tb, issuer_fname, issuer_output, issuer_traceback):
+    lines = []
+    parsed = True if tb is None else False
+    while tb is not None:
+        file_info = None
+        line = None
+        f = tb.tb_frame
+        lineno = tb.tb_lineno
+        co = f.f_code
+        filename = co.co_filename
+        if filename == issuer_fname:
+            parsed = True
+        if filename == issuer_fname and issuer_output and issuer_traceback:
+            file_info = '  File "{}", line {}'.format(issuer_traceback[lineno-1][0], issuer_traceback[lineno-1][1])
+            line = issuer_output[lineno-1]
+        elif parsed:
+            file_info = '  File "{}", line {}, in {}'.format(filename, lineno, co.co_name)
+            linecache.checkcache(filename)
+            line = linecache.getline(filename, lineno, f.f_globals)
+        if file_info:
+            lines.append(file_info)
+        if line:
+            lines.append('    ' + line.strip())
+        tb = tb.tb_next
+    if parsed:
+        lines.insert(0, 'Traceback (most recent call last):')
+        exc_lines = traceback.format_exception_only(etype, value)
+        for xln in exc_lines:
+            exc_line = xln.rstrip('\r\n')
+            if exc_line:
+                lines.append(exc_line)
+    return parsed, lines
+
+
+def _format_exception(etype, value):
+    return _parse_traceback_of_file(etype, value, None, None, None, None)
+
+
+def _exec_compile(source, fname):
+        return compile(source, fname, 'exec', _COMPILE_FLAGS, 1)
+
+
+def _parse_pragmas(fname):
+    tb_parsed, tb_lines = None, None
+    with open(fname, mode='rt') as fh:
+        try:
+            source = fh.read()
+            ast = _exec_compile(source, fname)
+        except SyntaxError:
+            etype, value, _ = sys.exc_info()
+            tb_parsed, tb_lines = _format_exception(etype, value)
+            if not tb_parsed:
+                raise
+    if tb_parsed:
+        tb_lines.insert(0, "Can't load makefile: '{}'".format(fname))
+        raise BuildSystemException('\n'.join(tb_lines))
+    with open(fname, mode='rt') as fh:
+        lines = [ ln.rstrip('\r\n') for ln in fh.readlines() ]
+    pragma_lines = []
+    stop_reparse = False
+    idx = 0
+    for ln in lines:
+        if stop_reparse:
+            break
+        idx += 1
+        if not stop_reparse:
+            ln_stripped = ln.strip()
+            if ln_stripped and not ln_stripped.startswith('#'):
+                stop_reparse = True
+            if not stop_reparse and ln_stripped.startswith('#pragma'):
+                pragma_lines += [(idx, ln)]
+    return pragma_lines
+
+
+def makefile_is_project_landmark(fname):
+    pragma_lines = _parse_pragmas(fname)
+    pragma_line = 0
+    for _, line in pragma_lines:
+        pragma_line += 1
+        m = _RE_PRAGMA_BUILD.match(line)
+        if m:
+            details = m.group(1)
+            if details:
+                return True, details.strip(), pragma_line
+            return True, None, pragma_line
+    return False, None, -1
+
+
+def load_buildconf_pragmas(fname):
+    buildconf_lines = []
+    pragma_lines = _parse_pragmas(fname)
+    for idx, line in pragma_lines:
+        if _RE_PRAGMA_BUILD.match(line):
+            continue
+        ln = line.replace('#pragma', '').strip()
+        buildconf_lines += [(idx, ln)]
+    return buildconf_lines
 
 
 def _parse_makefile_injection(line, regexp, project_root, working_dir):
@@ -33,7 +147,7 @@ class _ExtensionImportOrigin:
         self.src_line = src_line
 
 
-def _parse_make_file(project_root, working_dir, file_to_parse, required_by, output, file_parts, imports_table):
+def _parse_make_file(project_root, working_dir, file_to_parse, required_by, output, output_traceback, file_parts, imports_table):
     fname = normalize_path_optional(file_to_parse, working_dir)
     if fname in required_by:
        raise BuildSystemException("Got recursive instruction #include: file: '{}'.".format(fname))
@@ -42,19 +156,25 @@ def _parse_make_file(project_root, working_dir, file_to_parse, required_by, outp
 
     if not os.path.isfile(fname):
         if not required_by:
-            raise BuildSystemException("No such description: '{}'".format(fname))
+            raise BuildSystemException("Makefile not found: '{}'".format(fname))
         elif len(required_by) == 1:
-            raise BuildSystemException("No such description: '{}', required by: '{}'.".format(fname, required_by[0]))
+            raise BuildSystemException("Makefile not found: '{}', required by: '{}'.".format(fname, required_by[0]))
         else:
-            raise BuildSystemException("No such description: '{}', required by:\n  {}"
+            raise BuildSystemException("Makefile not found: '{}', required by:\n  {}"
                 .format(fname, ' <= '.join(required_by)))
 
+    tb_parsed, tb_lines = None, None
     with open(fname, mode='rt') as fh:
         try:
             source = fh.read()
-            ast = compile(source, fname, 'exec')
-        except SyntaxError as syntax:
-            raise BuildSystemException("Invalid syntax: file: '{}', line: {}, offset: {}.".format(fname, syntax.lineno, syntax.offset))
+            ast = _exec_compile(source, fname)
+        except SyntaxError:
+            etype, value, _ = sys.exc_info()
+            tb_parsed, tb_lines = _format_exception(etype, value)
+    if tb_parsed:
+        tb_origin = fname if not file_parts else file_parts[0]
+        tb_lines.insert(0, "Can't load makefile: '{}'".format(tb_origin))
+        raise BuildSystemException('\n'.join(tb_lines))
 
     file_parts.append(fname)
     stop_reparse = False
@@ -62,8 +182,8 @@ def _parse_make_file(project_root, working_dir, file_to_parse, required_by, outp
         lines = [ ln.rstrip('\r\n') for ln in fh.readlines() ]
     idx = 0
     for ln in lines:
+        idx += 1
         if not stop_reparse:
-            idx += 1
             ln_stripped = ln.strip()
             if ln_stripped and not ln_stripped.startswith('#'):
                 stop_reparse = True
@@ -72,7 +192,7 @@ def _parse_make_file(project_root, working_dir, file_to_parse, required_by, outp
                 if fname_inc is None:
                     raise BuildSystemException("Invalid #include syntax: file: '{}', line: {}".format(fname, idx))
                 required_by.insert(0, fname)
-                _parse_make_file(project_root, dir_of_file, fname_inc, required_by, output, file_parts, imports_table)
+                _parse_make_file(project_root, dir_of_file, fname_inc, required_by, output, output_traceback, file_parts, imports_table)
                 required_by.pop(0)
             if not stop_reparse and ln_stripped.startswith('#import'):
                 if imports_table is None:
@@ -86,16 +206,18 @@ def _parse_make_file(project_root, working_dir, file_to_parse, required_by, outp
                 imports_table[dname_import_id] = _ExtensionImportOrigin(dname_import, fname, idx)
 
         output.append(ln)
+        output_traceback.append((fname, idx))
 
 
 def _load_make_file(project_root, working_dir, fname, grammar_map, subst, buildsys_builtins, required_by, import_enabled):
     origin = []
     output = []
+    output_traceback = []
     file_parts = []
     imports_table = {} if import_enabled else None
     if required_by is not None:
         origin.insert(0, required_by)
-    _parse_make_file(project_root, working_dir, fname, origin, output, file_parts, imports_table)
+    _parse_make_file(project_root, working_dir, fname, origin, output, output_traceback, file_parts, imports_table)
     local_vars = {}
     for var_name in grammar_map:
         var_type = grammar_map[var_name][0]
@@ -103,12 +225,19 @@ def _load_make_file(project_root, working_dir, fname, grammar_map, subst, builds
         local_vars[var_name] = var_value
     if buildsys_builtins is not None:
         local_vars.update(buildsys_builtins)
+    tb_parsed, tb_lines = None, None
     try:
         text = '\n'.join(output)
-        text_ast = compile(text, file_parts[0], 'exec')
+        text_ast = _exec_compile(text, file_parts[0])
         exec(text_ast, {}, local_vars)
-    except SyntaxError as syntax:
-        raise BuildSystemException("Invalid syntax: file: '{}', line: {}, offset: {}.".format(file_parts[0], syntax.lineno, syntax.offset))
+    except:
+        etype, value, tb = sys.exc_info()
+        tb_parsed, tb_lines = _parse_traceback_of_file(etype, value, tb, file_parts[0], output, output_traceback)
+        if not tb_parsed:
+            raise
+    if tb_parsed:
+        tb_lines.insert(0, "Can't load makefile: '{}'".format(file_parts[0]))
+        raise BuildSystemException('\n'.join(tb_lines))
     grammar_tokens = {}
     for var_name in local_vars.keys():
         if var_name in grammar_map:
@@ -146,6 +275,9 @@ class BuildDescriptionLoader:
     def set_target_platform(self, value):
         self.buildsys_builtins[TAG_BUILDSYS_TARGET_PLATFORM] = value
 
+    def set_build_config(self, value):
+        self.buildsys_builtins[TAG_BUILDSYS_CONFIG] = value
+
     def set_toolset_name(self, value):
         self.buildsys_builtins[TAG_BUILDSYS_TOOLSET_NAME] = value
 
@@ -171,6 +303,14 @@ class BuildDescriptionLoader:
                 else:
                     desc._buildsys_import_list.append(ext_name)
                 desc._tokens[TAG_GRAMMAR_BUILTIN_SELF_FILE_PARTS].extend(ext._tokens[TAG_GRAMMAR_BUILTIN_SELF_FILE_PARTS])
+        if not desc.module_type:
+            raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_MODULE_TYPE))
+        if desc.module_type not in TAG_ALL_SUPPORTED_MODULE_TYPES:
+            raise BuildSystemException("Can't load makefile: '{}', given value '{}' of grammar token '{}' is not in list of supported values: '{}'".format(
+                desc.self_file_parts[0], desc.module_type, TAG_GRAMMAR_KEY_MODULE_TYPE, "', '".join(TAG_ALL_SUPPORTED_MODULE_TYPES)))
+        if not desc.module_name:
+            raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_MODULE_NAME))
+
         return desc
 
     def load_build_extension(self, working_dir, required_by):
@@ -179,4 +319,17 @@ class BuildDescriptionLoader:
         import_enabled = False
         grammar_tokens, _ = _load_make_file(project_root, working_dir, BUILD_MODULE_EXTENSION_FILE, TAG_GRAMMAR_KEYS_EXT_ALL,
             self.subst, buildsys_builtins, required_by, import_enabled)
-        return BuildDescription(grammar_tokens)
+        desc = BuildDescription(grammar_tokens)
+        if not desc.ext_type:
+            raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_EXT_TYPE))
+        if desc.ext_type not in TAG_ALL_SUPPORTED_EXTENTION_TYPES:
+            raise BuildSystemException("Can't load makefile: '{}', given value '{}' of grammar token '{}' is not in list of supported values: '{}'".format(
+                desc.self_file_parts[0], desc.ext_type, TAG_GRAMMAR_KEY_EXT_TYPE, "', '".join(TAG_ALL_SUPPORTED_EXTENTION_TYPES)))
+        if not desc.ext_call_type:
+            raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_EXT_CALL_TYPE))
+        if desc.ext_call_type not in TAG_ALL_SUPPORTED_EXTENTION_CALL_TYPES:
+            raise BuildSystemException("Can't load makefile: '{}', given value '{}' of grammar token '{}' is not in list of supported values: '{}'".format(
+                desc.self_file_parts[0], desc.ext_call_type, TAG_GRAMMAR_KEY_EXT_CALL_TYPE, "', '".join(TAG_ALL_SUPPORTED_EXTENTION_CALL_TYPES)))
+        if not desc.ext_name:
+            raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_EXT_NAME))
+        return desc

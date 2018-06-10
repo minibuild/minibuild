@@ -15,7 +15,7 @@ def _pass_exclusion_constraints(arcpath, arcname, excl_rules):
     rule_arcpath_endswith       = excl_rules.get(TAG_GRAMMAR_SPEC_ATTR_IF_ARCPATH_STARTSWITH)
     rule_arcname_not_equals     = excl_rules.get(TAG_GRAMMAR_SPEC_ATTR_IF_NOT_ARCNAME_EQUALS)
     rule_arcname_not_startswith = excl_rules.get(TAG_GRAMMAR_SPEC_ATTR_IF_NOT_ARCNAME_STARTSWITH)
-    rule_arcname_not_endswith   = excl_rules.get(TAG_GRAMMAR_SPEC_ATTR_IF_NOT_NOT_ARCNAME_ENDSWITH)
+    rule_arcname_not_endswith   = excl_rules.get(TAG_GRAMMAR_SPEC_ATTR_IF_NOT_ARCNAME_ENDSWITH)
     rule_arcpath_not_equals     = excl_rules.get(TAG_GRAMMAR_SPEC_ATTR_IF_NOT_ARCPATH_EQUALS)
     rule_arcpath_not_startswith = excl_rules.get(TAG_GRAMMAR_SPEC_ATTR_IF_NOT_ARCPATH_STARTSWITH)
     rule_arcpath_not_endswith   = excl_rules.get(TAG_GRAMMAR_SPEC_ATTR_IF_NOT_ARCPATH_ENDSWITH)
@@ -37,7 +37,7 @@ def _pass_exclusion_constraints(arcpath, arcname, excl_rules):
             if r != arcname:
                 return False
     if rule_arcname_not_startswith:
-        for r in rule_arcname_startswith:
+        for r in rule_arcname_not_startswith:
             if not arcname.startswith(r):
                 return False
     if rule_arcname_not_endswith:
@@ -61,7 +61,7 @@ def _pass_exclusion_constraints(arcpath, arcname, excl_rules):
             if r != arcpath:
                 return False
     if rule_arcpath_not_startswith:
-        for r in rule_arcpath_startswith:
+        for r in rule_arcpath_not_startswith:
             if not arcpath.startswith(r):
                 return False
     if rule_arcpath_not_endswith:
