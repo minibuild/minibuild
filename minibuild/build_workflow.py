@@ -180,15 +180,19 @@ def build_zip_module(sysinfo, grammar_substitutions, description, force, verbose
 def download_link(url, target_file):
         context = None
         if url.startswith('https:'):
-            import ssl
-            context = ssl._create_unverified_context()
+            if (sys.version_info.major, sys.version_info.minor, sys.version_info.micro) >= (2,7,9):
+                import ssl
+                context = ssl._create_unverified_context()
         if sys.version_info.major < 3:
-            import urllib
-            urlopen = urllib.urlopen
+            import urllib2
+            urlopen = urllib2.urlopen
         else:
             import urllib.request
             urlopen = urllib.request.urlopen
-        response = urlopen(url, context=context)
+        if context is not None:
+            response = urlopen(url, context=context)
+        else:
+            response = urlopen(url)
         payload = response.read()
         with open(target_file, mode='wb') as file_object:
             file_object.write(payload)
@@ -291,26 +295,35 @@ class BuildWorkflow:
         self._imported_extensions[ext_description.ext_name] = BuildExtensionEntry(dname_import, ext_description)
         return ext_description
 
-    def run(self, build_directory, used_model_name, build_config, public, rebuild_level, verbose):
+    def run(self, build_directory, used_model_name, build_config, public, public_format, public_layout, rebuild_level, verbose):
         _, loader = self._toolset_models_mapping[used_model_name]
         description = loader.load_build_description(build_directory)
         build_result = self._perform_build(description, used_model_name, build_config, rebuild_level, verbose)
         if public and description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_COMPOSITE:
-            self._publish_composite_artifacts(build_result, description, used_model_name, build_config, rebuild_level, verbose)
+            self._publish_composite_artifacts(build_result, description, used_model_name, build_config, public_format, public_layout, rebuild_level, verbose)
 
-    def _publish_composite_artifacts(self, build_result, description, used_model_name, build_config, rebuild_level, verbose):
+    def _publish_composite_artifacts(self, build_result, description, used_model_name, build_config, public_format, public_layout, rebuild_level, verbose):
         being_built, artifacts = build_result[0], build_result[1]
         composite_obj_dir_prefix = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, used_model_name, build_config) + os.sep
         composite_obj_dir_prefix_length = len(composite_obj_dir_prefix)
-        model_public_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_PUBLIC], used_model_name, build_config)
+        if public_layout == TAG_PUBLIC_LAYAOUT_FLAT:
+            public_dir = self._sysinfo[TAG_CFG_DIR_PUBLIC]
+        else:
+            public_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_PUBLIC], used_model_name, build_config)
+        public_name = description.public_name if description.public_name else description.module_name
         toolset, _ = self._toolset_models_mapping[used_model_name]
         current_model = toolset.supported_models[used_model_name]
-        publish_in_posix_format = True if current_model.platform_alias == TAG_PLATFORM_ALIAS_POSIX else False
-        if publish_in_posix_format:
-            publication = os.path.join(model_public_dir, description.module_name + '.tgz')
+        if public_format is not None:
+            publish_in_tgz_format = True if public_format == TAG_PUBLIC_FORMAT_TGZ else False
         else:
-            publication = os.path.join(model_public_dir, description.module_name + '.zip')
-        print("BUILDSYS: publishing: {}".format(publication))
+            publish_in_tgz_format = True if current_model.platform_alias == TAG_PLATFORM_ALIAS_POSIX else False
+        if publish_in_tgz_format:
+            current_format = TAG_PUBLIC_FORMAT_TGZ
+            publication = os.path.join(public_dir, public_name + '.tgz')
+        else:
+            current_format = TAG_PUBLIC_FORMAT_ZIP
+            publication = os.path.join(public_dir, public_name + '.zip')
+        print("BUILDSYS: publishing: {}: {}".format(current_format, publication))
         catalog = []
         for art in artifacts:
             if not art.path.startswith(composite_obj_dir_prefix):
@@ -321,14 +334,15 @@ class BuildWorkflow:
         if not do_publish:
             do_publish = being_built
         if not do_publish:
-            if not is_target_up_to_date(publication, None, artifacts, verbose):
+            up_to_date, _ = is_target_up_to_date(publication, None, artifacts, verbose)
+            if not up_to_date:
                 do_publish = True
         if not do_publish:
             print("BUILDSYS: up-to-date: '{}', PUBLIC".format(description.module_name))
             return
 
-        mkdir_safe(model_public_dir)
-        if publish_in_posix_format:
+        mkdir_safe(public_dir)
+        if publish_in_tgz_format:
             with tarfile.open(publication, mode='w:gz') as z:
                 for node in catalog:
                     art, arcname = node[0], node[1]

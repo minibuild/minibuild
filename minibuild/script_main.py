@@ -5,15 +5,17 @@ import os
 import os.path
 import platform
 import shlex
+import subprocess
 import sys
 
-from .build_description import BuildDescriptionLoader, makefile_is_project_landmark
+from .build_description import BuildDescriptionLoader
 from .build_workflow import BuildWorkflow
 from .config_ini import *
 from .constants import *
 from .error_utils import BuildSystemException
 from .gen_bconf import generate_build_config
 from .os_utils import *
+from .pragma_tokens import load_buildconf_pragmas, makefile_is_project_landmark
 from .__version__ import __version__
 
 
@@ -253,6 +255,22 @@ def format_version_string(frozen):
     return "minibuild {} [{}]".format(__version__, ' '.join(ext_bits))
 
 
+class PassThroughCommand:
+    def __init__(self, fname, lineno, argv, pass_with_interpreter):
+        self.fname = fname
+        self.lineno = lineno
+        self.argv = argv
+        self.pass_with_interpreter = pass_with_interpreter
+
+
+class PassThroughCommandList:
+    def __init__(self):
+        self.items = []
+
+    def append(self, item):
+        self.items.append(item)
+
+
 def create_build_workflow(frozen, build_directory, verbose, argv):
     buildsys_error = None
     toolset_choices = []
@@ -362,8 +380,6 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
                 toolset_init_args = {}
             toolset_init_requests += [ (toolset_module_title, toolset_init_args) ]
 
-        build_description_fname = os.path.join(os.getcwd(), BUILD_MODULE_DESCRIPTION_FILE)
-
         subst_info = {
             TAG_SUBST_PROJECT_ROOT: project_root,
             TAG_SUBST_PROJECT_OUTPUT: output_dname,
@@ -381,7 +397,7 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
                 except ImportError:
                     raise BuildSystemException("Malformed project config file: got unknown toolset module: '{}'.".format(toolset_module_title))
 
-            desc_loader = BuildDescriptionLoader()
+            desc_loader = BuildDescriptionLoader(sys_platform, sys_arch)
             toolset = mod_toolset.create_toolset(sysinfo, desc_loader, **toolset_init_args)
             desc_loader.set_toolset_name(toolset.toolset_name)
             desc_loader.set_target_platform(toolset.platform_name)
@@ -400,13 +416,13 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
         pass
 
     if buildsys_error is None:
-        models_help_prefix = '1)primary ' if model_aliases else ''
-        models_help = '{}choices: {}'.format(models_help_prefix, ', '.join(toolset_choices))
+        models_help_prefix = '1) primary ' if model_aliases else ''
+        models_help = 'R|{}choices:\n    {}'.format(models_help_prefix, '\n    '.join(toolset_choices))
         alias_choises = []
         for alias in sorted(model_aliases):
             alias_choises.append(alias)
         if alias_choises:
-            models_help = "{}\n2)aliases: {}".format(models_help, ', '.join(alias_choises))
+            models_help = "{}\n2) aliases:\n    {}".format(models_help, '\n    '.join(alias_choises))
     else:
         models_help = 'build model'
 
@@ -414,9 +430,14 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
     parser.add_argument('--model',     nargs='?', help=models_help)
     parser.add_argument('--config',    nargs='?', choices=BUILD_CONFIG_ALL, default=BUILD_CONFIG_RELEASE, help='build configuration')
     parser.add_argument('--directory', nargs='?', help='startup directory for build')
+    parser.add_argument('--pass',      action='store_true', dest='pass_through', help='proceed with command-lines from makefile')
     parser.add_argument('--force',     choices=[-1,0,1,2],  default=0, type=int,
         help='R|implied rebuild level (default is 0)\n   -1: skip build of dependent targets\n    0: as needed\n    1: force rebuild of current module only\n    2: force rebuild of all targets')
     parser.add_argument('--public',    action='store_true', help='when building composite target publish it as zip/tgz')
+    parser.add_argument('--public-format', nargs='?', choices=['auto'] + TAG_PUBLIC_FORMAT_ALL[:], default='auto',
+        help="public format, default is 'auto', i.e. 'zip' when target is built for Windows and 'tgz' otherwise")
+    parser.add_argument('--public-layout', nargs='?', choices=['default', TAG_PUBLIC_LAYAOUT_FLAT], default='default',
+        help="public layout, 'flat' means to avoid any subdirectories creation when publishing")
     parser.add_argument('--verbose',   action='store_true', help='verbose output on build')
     parser.add_argument('--version',   action='store_true', help='print version number and exit')
     if frozen:
@@ -433,6 +454,37 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
 
     if buildsys_error is not None:
         raise buildsys_error
+
+    public_format = None
+    if args.public_format in TAG_PUBLIC_FORMAT_ALL:
+        public_format = args.public_format
+
+    public_layout = TAG_PUBLIC_LAYAOUT_FLAT if args.public_layout == TAG_PUBLIC_LAYAOUT_FLAT else None
+
+    if args.pass_through:
+        pass_through_commands = PassThroughCommandList()
+        build_description_fname = os.path.join(build_directory, BUILD_MODULE_DESCRIPTION_FILE)
+        if not os.path.isfile(build_description_fname):
+            raise BuildSystemException("Makefile not found: '{}'".format(build_description_fname))
+        pragmas = load_buildconf_pragmas(build_description_fname, sys_platform)
+        for pragma in pragmas:
+            if pragma.pragma_id != TAG_PRAGMA_TOKEN_KEY_PASS:
+                continue
+            if TAG_PRAGMA_TOKEN_KEY_CMDLINE not in pragma.options or not pragma.options[TAG_PRAGMA_TOKEN_KEY_CMDLINE]:
+                raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, token: '{}' not given.".format(build_description_fname, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_CMDLINE))
+            pass_err = None
+            try:
+                posix = False if sys.platform == 'win32' else True
+                pass_argv = shlex.split(pragma.options[TAG_PRAGMA_TOKEN_KEY_CMDLINE], comments=False, posix=posix)
+            except ValueError as ex:
+                pass_err = str(ex)
+            if pass_err is not None:
+                raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, value of token '{}' is malformed: {}".format(build_description_fname, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_CMDLINE, pass_err))
+            pass_with_interpreter = True if pragma.options.get('interpreter') else False
+            pass_through_commands.append(PassThroughCommand(build_description_fname, pragma.lineno, pass_argv, pass_with_interpreter))
+            if verbose:
+                print("BUILDSYS: #pragma # pass # cmdline: {}".format(pragma.options[TAG_PRAGMA_TOKEN_KEY_CMDLINE]))
+        return None, pass_through_commands
 
     if not args.model:
         arg_model = eval_default_model(config, sys_platform, sys_arch)
@@ -468,13 +520,15 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
     build_args['used_model_name'] = arg_model
     build_args['build_config'] = args.config
     build_args['public'] = args.public
+    build_args['public_format'] = public_format
+    build_args['public_layout'] = public_layout
     build_args['rebuild_level'] = args.force
     build_args['verbose'] = verbose
 
     return logic, build_args
 
 
-def preload_argv(args):
+def preload_argv(args, dir_redirect):
     argv = []
     verbose = False
     arg_dir = None
@@ -492,12 +546,56 @@ def preload_argv(args):
                 continue
         argv.append(arg)
     if arg_dir is not None:
-        build_directory = os.path.abspath(os.path.normpath(arg_dir))
+        build_directory = normalize_path_optional(arg_dir, dir_redirect)
         if not os.path.isdir(build_directory):
             raise BuildSystemException("Invalid build directoty '{}' is given in command line, directory '{}' is not found.".format(arg_dir, build_directory))
     else:
-        build_directory = os.getcwd()
+        build_directory = dir_redirect
     return build_directory, verbose, argv
+
+
+def invoke_interpreter(argv, cwd, frozen, verbose):
+    argv = argv[:]
+    if frozen:
+        argv.insert(0, '--interpreter')
+    argv.insert(0, sys.executable)
+    if verbose:
+        print("BUILDSYS: EXEC: ['{}'], CWD: '{}'".format("','".join(argv), cwd))
+    p = subprocess.Popen(argv, cwd=cwd)
+    p.communicate()
+    if p.returncode != 0:
+        raise BuildSystemException("Pass-through command completed with non-zero exit code.")
+
+
+def script_main_perform(argv_in, frozen, dir_redirect, walks, level, verbose=None):
+    pass_with_interpreter = False
+    if isinstance(argv_in, PassThroughCommand):
+        argv = argv_in.argv
+        pass_with_interpreter = argv_in.pass_with_interpreter
+    else:
+        argv = argv_in
+
+    if pass_with_interpreter:
+        invoke_interpreter(argv, dir_redirect, frozen, verbose)
+        return
+
+    build_directory, _verbose, argv = preload_argv(argv, dir_redirect)
+    if verbose is None:
+        verbose = _verbose
+    if verbose:
+        print("BUILDSYS: CWD: {}".format(build_directory))
+        print("BUILDSYS: RUN: {}".format(' '.join(argv)))
+    if build_directory in walks:
+        raise BuildSystemException("Maximum recursion depth exceeded, see #pragma in '{}', line: {}".format(argv_in.fname, argv_in.lineno))
+    walks.add(build_directory)
+    logic, args = create_build_workflow(frozen, build_directory, verbose, argv)
+    if logic is not None:
+        logic.run(**args)
+    elif isinstance(args, PassThroughCommandList):
+        for cmd in args.items:
+            if level == 0:
+                walks.clear()
+            script_main_perform(cmd, frozen, build_directory, walks, level+1, verbose)
 
 
 def script_main(argv=None, frozen=False):
@@ -510,12 +608,9 @@ def script_main(argv=None, frozen=False):
         if len(argv) == 1 and argv[0] == '--version':
             print(format_version_string(frozen))
             return 0
-        build_directory, verbose, argv = preload_argv(argv)
-        logic, args = create_build_workflow(frozen, build_directory, verbose, argv)
-        if logic is not None:
-            logic.run(**args)
+        walks = set()
+        script_main_perform(argv, frozen, os.getcwd(), walks, 0)
         return 0
-
     except BuildSystemException as exc:
         if not safe:
             raise

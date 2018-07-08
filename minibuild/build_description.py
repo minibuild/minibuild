@@ -1,129 +1,17 @@
-import linecache
 import os.path
 import re
 import sys
-import traceback
 
 from .constants import *
 from .error_utils import BuildSystemException
 from .grammar_subst import preprocess_grammar_value
+from .makefile_core import exec_compile, format_makefile_exception, parse_traceback_of_makefile
 from .os_utils import normalize_path_optional
 from .string_utils import is_string_instance
 
 
 _RE_INC = re.compile(r'^#include\s+"([\S]+)"\s*$')
 _RE_IMP = re.compile(r'^#import\s+"([\S]+)"\s*$')
-
-_RE_PRAGMA_BUILD = re.compile(r'^#pragma\s+build\b(.*)$')
-
-if sys.version_info.major < 3:
-    _CO_FUTURE_DIVISION         = 0x02000  # division
-    _CO_FUTURE_ABSOLUTE_IMPORT  = 0x04000  # perform absolute imports by default
-    _CO_FUTURE_WITH_STATEMENT   = 0x08000  # with statement
-    _CO_FUTURE_PRINT_FUNCTION   = 0x10000  # print function
-
-    _COMPILE_FLAGS = _CO_FUTURE_DIVISION | _CO_FUTURE_ABSOLUTE_IMPORT | _CO_FUTURE_WITH_STATEMENT | _CO_FUTURE_PRINT_FUNCTION
-else:
-    _COMPILE_FLAGS = 0
-
-
-def _parse_traceback_of_file(etype, value, tb, issuer_fname, issuer_output, issuer_traceback):
-    lines = []
-    parsed = True if tb is None else False
-    while tb is not None:
-        file_info = None
-        line = None
-        f = tb.tb_frame
-        lineno = tb.tb_lineno
-        co = f.f_code
-        filename = co.co_filename
-        if filename == issuer_fname:
-            parsed = True
-        if filename == issuer_fname and issuer_output and issuer_traceback:
-            file_info = '  File "{}", line {}'.format(issuer_traceback[lineno-1][0], issuer_traceback[lineno-1][1])
-            line = issuer_output[lineno-1]
-        elif parsed:
-            file_info = '  File "{}", line {}, in {}'.format(filename, lineno, co.co_name)
-            linecache.checkcache(filename)
-            line = linecache.getline(filename, lineno, f.f_globals)
-        if file_info:
-            lines.append(file_info)
-        if line:
-            lines.append('    ' + line.strip())
-        tb = tb.tb_next
-    if parsed:
-        lines.insert(0, 'Traceback (most recent call last):')
-        exc_lines = traceback.format_exception_only(etype, value)
-        for xln in exc_lines:
-            exc_line = xln.rstrip('\r\n')
-            if exc_line:
-                lines.append(exc_line)
-    return parsed, lines
-
-
-def _format_exception(etype, value):
-    return _parse_traceback_of_file(etype, value, None, None, None, None)
-
-
-def _exec_compile(source, fname):
-        return compile(source, fname, 'exec', _COMPILE_FLAGS, 1)
-
-
-def _parse_pragmas(fname):
-    tb_parsed, tb_lines = None, None
-    with open(fname, mode='rt') as fh:
-        try:
-            source = fh.read()
-            ast = _exec_compile(source, fname)
-        except SyntaxError:
-            etype, value, _ = sys.exc_info()
-            tb_parsed, tb_lines = _format_exception(etype, value)
-            if not tb_parsed:
-                raise
-    if tb_parsed:
-        tb_lines.insert(0, "Can't load makefile: '{}'".format(fname))
-        raise BuildSystemException('\n'.join(tb_lines))
-    with open(fname, mode='rt') as fh:
-        lines = [ ln.rstrip('\r\n') for ln in fh.readlines() ]
-    pragma_lines = []
-    stop_reparse = False
-    idx = 0
-    for ln in lines:
-        if stop_reparse:
-            break
-        idx += 1
-        if not stop_reparse:
-            ln_stripped = ln.strip()
-            if ln_stripped and not ln_stripped.startswith('#'):
-                stop_reparse = True
-            if not stop_reparse and ln_stripped.startswith('#pragma'):
-                pragma_lines += [(idx, ln)]
-    return pragma_lines
-
-
-def makefile_is_project_landmark(fname):
-    pragma_lines = _parse_pragmas(fname)
-    pragma_line = 0
-    for _, line in pragma_lines:
-        pragma_line += 1
-        m = _RE_PRAGMA_BUILD.match(line)
-        if m:
-            details = m.group(1)
-            if details:
-                return True, details.strip(), pragma_line
-            return True, None, pragma_line
-    return False, None, -1
-
-
-def load_buildconf_pragmas(fname):
-    buildconf_lines = []
-    pragma_lines = _parse_pragmas(fname)
-    for idx, line in pragma_lines:
-        if _RE_PRAGMA_BUILD.match(line):
-            continue
-        ln = line.replace('#pragma', '').strip()
-        buildconf_lines += [(idx, ln)]
-    return buildconf_lines
 
 
 def _parse_makefile_injection(line, regexp, project_root, working_dir):
@@ -147,7 +35,7 @@ class _ExtensionImportOrigin:
         self.src_line = src_line
 
 
-def _parse_make_file(project_root, working_dir, file_to_parse, required_by, output, output_traceback, file_parts, imports_table):
+def _parse_makefile(project_root, working_dir, file_to_parse, required_by, output, output_traceback, file_parts, imports_table):
     fname = normalize_path_optional(file_to_parse, working_dir)
     if fname in required_by:
        raise BuildSystemException("Got recursive instruction #include: file: '{}'.".format(fname))
@@ -167,10 +55,10 @@ def _parse_make_file(project_root, working_dir, file_to_parse, required_by, outp
     with open(fname, mode='rt') as fh:
         try:
             source = fh.read()
-            ast = _exec_compile(source, fname)
+            ast = exec_compile(source, fname)
         except SyntaxError:
             etype, value, _ = sys.exc_info()
-            tb_parsed, tb_lines = _format_exception(etype, value)
+            tb_parsed, tb_lines = format_makefile_exception(etype, value)
     if tb_parsed:
         tb_origin = fname if not file_parts else file_parts[0]
         tb_lines.insert(0, "Can't load makefile: '{}'".format(tb_origin))
@@ -192,7 +80,7 @@ def _parse_make_file(project_root, working_dir, file_to_parse, required_by, outp
                 if fname_inc is None:
                     raise BuildSystemException("Invalid #include syntax: file: '{}', line: {}".format(fname, idx))
                 required_by.insert(0, fname)
-                _parse_make_file(project_root, dir_of_file, fname_inc, required_by, output, output_traceback, file_parts, imports_table)
+                _parse_makefile(project_root, dir_of_file, fname_inc, required_by, output, output_traceback, file_parts, imports_table)
                 required_by.pop(0)
             if not stop_reparse and ln_stripped.startswith('#import'):
                 if imports_table is None:
@@ -209,7 +97,7 @@ def _parse_make_file(project_root, working_dir, file_to_parse, required_by, outp
         output_traceback.append((fname, idx))
 
 
-def _load_make_file(project_root, working_dir, fname, grammar_map, subst, buildsys_builtins, required_by, import_enabled):
+def _load_makefile(project_root, working_dir, fname, grammar_map, subst, buildsys_builtins, required_by, import_enabled):
     origin = []
     output = []
     output_traceback = []
@@ -217,7 +105,7 @@ def _load_make_file(project_root, working_dir, fname, grammar_map, subst, builds
     imports_table = {} if import_enabled else None
     if required_by is not None:
         origin.insert(0, required_by)
-    _parse_make_file(project_root, working_dir, fname, origin, output, output_traceback, file_parts, imports_table)
+    _parse_makefile(project_root, working_dir, fname, origin, output, output_traceback, file_parts, imports_table)
     local_vars = {}
     for var_name in grammar_map:
         var_type = grammar_map[var_name][0]
@@ -225,14 +113,17 @@ def _load_make_file(project_root, working_dir, fname, grammar_map, subst, builds
         local_vars[var_name] = var_value
     if buildsys_builtins is not None:
         local_vars.update(buildsys_builtins)
+        local_vars.update({
+            TAG_BUILDSYS_MAKEFILE_DIRNAME: os.path.dirname(file_parts[0])
+        })
     tb_parsed, tb_lines = None, None
     try:
         text = '\n'.join(output)
-        text_ast = _exec_compile(text, file_parts[0])
+        text_ast = exec_compile(text, file_parts[0])
         exec(text_ast, {}, local_vars)
     except:
         etype, value, tb = sys.exc_info()
-        tb_parsed, tb_lines = _parse_traceback_of_file(etype, value, tb, file_parts[0], output, output_traceback)
+        tb_parsed, tb_lines = parse_traceback_of_makefile(etype, value, tb, file_parts[0], output, output_traceback)
         if not tb_parsed:
             raise
     if tb_parsed:
@@ -267,8 +158,11 @@ class BuildDescription:
 
 
 class BuildDescriptionLoader:
-    def __init__(self):
-        self.buildsys_builtins = {}
+    def __init__(self, sys_platform, sys_arch):
+        self.buildsys_builtins = {
+            TAG_BUILDSYS_HOST_PLATFORM: sys_platform,
+            TAG_BUILDSYS_HOST_ARCH: sys_arch,
+        }
         self.subst = {}
         self.import_hook = None
 
@@ -283,6 +177,8 @@ class BuildDescriptionLoader:
 
     def set_substitutions(self, subst_info):
         self.subst = subst_info
+        self.buildsys_builtins[TAG_BUILDSYS_PROJECT_ROOT_DIRNAME] = self.subst[TAG_SUBST_PROJECT_ROOT]
+        self.buildsys_builtins[TAG_BUILDSYS_PROJECT_OUTPUT_DIRNAME] = self.subst[TAG_SUBST_PROJECT_OUTPUT]
 
     def set_import_hook(self, import_hook):
         self.import_hook = import_hook
@@ -290,7 +186,7 @@ class BuildDescriptionLoader:
     def load_build_description(self, working_dir, required_by=None):
         project_root = self.subst[TAG_SUBST_PROJECT_ROOT]
         import_enabled = callable(self.import_hook)
-        grammar_tokens, imports = _load_make_file(project_root, working_dir, BUILD_MODULE_DESCRIPTION_FILE, TAG_GRAMMAR_KEYS_ALL,
+        grammar_tokens, imports = _load_makefile(project_root, working_dir, BUILD_MODULE_DESCRIPTION_FILE, TAG_GRAMMAR_KEYS_ALL,
             self.subst, self.buildsys_builtins, required_by, import_enabled)
         desc = BuildDescription(grammar_tokens)
         if imports:
@@ -317,7 +213,7 @@ class BuildDescriptionLoader:
         project_root = self.subst[TAG_SUBST_PROJECT_ROOT]
         buildsys_builtins = None
         import_enabled = False
-        grammar_tokens, _ = _load_make_file(project_root, working_dir, BUILD_MODULE_EXTENSION_FILE, TAG_GRAMMAR_KEYS_EXT_ALL,
+        grammar_tokens, _ = _load_makefile(project_root, working_dir, BUILD_MODULE_EXTENSION_FILE, TAG_GRAMMAR_KEYS_EXT_ALL,
             self.subst, buildsys_builtins, required_by, import_enabled)
         desc = BuildDescription(grammar_tokens)
         if not desc.ext_type:

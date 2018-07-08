@@ -27,6 +27,9 @@ Some other _grammar tokens_ are **platform extendable**. So if for example gramm
   _string_, effective when _module_type='executable'_    
   The file name of executable binary being built. When this option is not given, then value of the option `module_name` is used instead.  
   
+*  **public_name**  
+  The name of zip-archive for publishing, when given it is used instead of `module_name`.  
+  
 * **build_list**  
   _list of strings_  
   The list of file names (not paths) of which describing module consists of.  

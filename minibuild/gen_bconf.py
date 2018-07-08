@@ -2,12 +2,13 @@ from __future__ import print_function
 import importlib
 import os.path
 import shlex
+import sys
 
 from .arch_parse import parse_arch_specific_tokens
-from .build_description import load_buildconf_pragmas
 from .constants import *
 from .depends_check import prerequisite_newer_then_target
 from .error_utils import BuildSystemException
+from .pragma_tokens import load_buildconf_pragmas
 
 
 class _ToolsetPragmaConfig:
@@ -53,97 +54,68 @@ def _generate_build_config_imp(config_proto, dest_config, sys_platform, sys_arch
     aliases_mapping = {}
     arch_substitutions = {'sys': sys_arch}
 
-    pragmas = load_buildconf_pragmas(config_proto)
+    pragmas = load_buildconf_pragmas(config_proto, sys_platform)
 
-    for idx, ln in pragmas:
-        pragma_os = None
-        argv = shlex.split(ln)
-        ok = True if argv else False
-        for arg in argv:
-            if not arg:
-                ok = False
-                break
-            if pragma_os is None:
-                if arg.startswith('os:'):
-                    pragma_os = arg[3:]
-        if not ok:
-            raise BuildSystemException("Can't load makefile: '{}', got malformed instruction #pragma at line: {}".format(config_proto, idx))
-        if not pragma_os:
-            raise BuildSystemException("Can't load makefile: '{}', got malformed instruction #pragma at line: {}, OS value is unknown.".format(config_proto, idx))
-        if pragma_os == sys_platform or pragma_os == 'all':
-            pragma_args = list(filter(lambda x : not x.startswith('os:'), argv))
-            pragma_token = None
-            if pragma_args:
-                pragma_token = pragma_args[0]
-            if not pragma_token:
-                raise BuildSystemException("Can't load makefile: '{}', got malformed instruction #pragma at line: {}, no tokens.".format(config_proto, idx))
-            if pragma_token not in TAG_KNOWN_PRAGMA_TOKENS:
-                raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, got unknown token '{}'.".format(config_proto, idx, pragma_token))
-            pragma_options = {}
-            del pragma_args[0]
-            for arg in pragma_args:
-                if '=' not in arg:
-                    raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, malformed token: '{}'.".format(config_proto, idx, arg))
-                k, v = arg.split('=', 1)
-                pragma_options[k] = v
-            if pragma_token == TAG_PRAGMA_NASM:
-                if TAG_PRAGMA_TOKEN_KEY_EXECUTABLE in pragma_options:
-                    nasm_executable = pragma_options[TAG_PRAGMA_TOKEN_KEY_EXECUTABLE]
-                    if verbose:
-                        print("BUILDSYS: #pragma # nasm # executable: '{}'".format(nasm_executable))
-            elif pragma_token == TAG_PRAGMA_NATIVE:
-                if TAG_PRAGMA_TOKEN_KEY_MODEL not in pragma_options or not pragma_options[TAG_PRAGMA_TOKEN_KEY_MODEL]:
-                    raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, token: '{}' not given.".format(config_proto, idx, TAG_PRAGMA_TOKEN_KEY_MODEL))
-                native_model = pragma_options[TAG_PRAGMA_TOKEN_KEY_MODEL]
-                if native_model in [TAG_NATIVE_MODELS_DETECTION_DISABLED, TAG_NATIVE_MODELS_DETECTION_OPTIONAL, TAG_NATIVE_MODELS_DETECTION_AUTO]:
-                    native_model_mode = native_model
-                else:
-                    native_model_mode = TAG_NATIVE_MODELS_DETECTION_CONFIG
-                    native_model_value = native_model
-
-            elif pragma_token == TAG_PRAGMA_TOOLSET:
-                if TAG_PRAGMA_TOKEN_KEY_MODULE not in pragma_options or not pragma_options[TAG_PRAGMA_TOKEN_KEY_MODULE]:
-                    raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, token: '{}' not given.".format(config_proto, idx, TAG_PRAGMA_TOKEN_KEY_MODULE))
-                toolset_name = pragma_options[TAG_PRAGMA_TOKEN_KEY_MODULE]
-                toolset_subtype = None
-                if toolset_name == 'mingw':
-                    toolset_subtype = 'mingw'
-                    toolset_name = 'gcc'
-                elif toolset_name == 'xtools':
-                    toolset_subtype = 'xtools'
-                    toolset_name = 'gcc'
-                mod_toolset = imported_toolset_modules.get(toolset_name)
-                if mod_toolset is None:
-                    toolset_module_name = '{}.toolset_{}'.format(__package__, toolset_name)
-                    try:
-                        mod_toolset = importlib.import_module(toolset_module_name)
-                        imported_toolset_modules[toolset_name] = mod_toolset
-                    except ImportError:
-                        raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, got unknown toolset module: '{}'.".format(config_proto, idx, toolset_name))
-                del pragma_options[TAG_PRAGMA_TOKEN_KEY_MODULE]
-
-                toolset_model_aliases = {}
-                if TAG_PRAGMA_TOKEN_KEY_ALIAS in pragma_options and pragma_options[TAG_PRAGMA_TOKEN_KEY_ALIAS]:
-                    model_aliases = pragma_options[TAG_PRAGMA_TOKEN_KEY_ALIAS]
-                    del pragma_options[TAG_PRAGMA_TOKEN_KEY_ALIAS]
-                    aliases_arch_list, toolset_model_aliases = parse_arch_specific_tokens(model_aliases, TAG_ALL_KNOWN_ARCH_LIST, allow_empty_tokens=False, arch_substitutions=arch_substitutions)
-                    if not aliases_arch_list:
-                        raise BuildSystemException("Can't process makefile: '{}', instruction #pragma at line: {}, token '{}' is malformed: '{}'".format(config_proto, idx, TAG_PRAGMA_TOKEN_KEY_ALIAS, model_aliases))
-
-                conf = _ToolsetPragmaConfig(toolset_name, idx, pragma_options, toolset_subtype, toolset_model_aliases)
-                toolset_init_requests.append(conf)
-
-            elif pragma_token == TAG_PRAGMA_DEFAULT_MODELS:
-                if pragma_os == 'all':
-                    raise BuildSystemException("Can't process makefile: '{}', instruction #pragma at line: {}, token '{}' must be OS specific.".format(config_proto, idx, TAG_PRAGMA_TOKEN_KEY_MODEL))
-                if TAG_PRAGMA_TOKEN_KEY_MODEL not in pragma_options or not pragma_options[TAG_PRAGMA_TOKEN_KEY_MODEL]:
-                    raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, token: '{}' not given.".format(config_proto, idx, TAG_PRAGMA_TOKEN_KEY_MODEL))
-                pragma_default_models = pragma_options[TAG_PRAGMA_TOKEN_KEY_MODEL]
-                arch_list_with_default_models, default_models_per_arch = parse_arch_specific_tokens(pragma_default_models, TAG_ALL_KNOWN_ARCH_LIST, allow_empty_tokens=False, arch_substitutions=arch_substitutions)
-                if not arch_list_with_default_models:
-                    raise BuildSystemException("Can't process makefile: '{}', instruction #pragma at line: {}, token '{}' is malformed: '{}'".format(config_proto, idx, TAG_PRAGMA_TOKEN_KEY_MODEL, pragma_default_models))
+    for pragma in pragmas:
+        if pragma.pragma_id == TAG_PRAGMA_NASM:
+            if TAG_PRAGMA_TOKEN_KEY_EXECUTABLE in pragma.options:
+                nasm_executable = pragma.options[TAG_PRAGMA_TOKEN_KEY_EXECUTABLE]
                 if verbose:
-                    print("BUILDSYS: #pragma line: {:2} # {} # {}".format(idx, 'default models', pragma_default_models))
+                    print("BUILDSYS: #pragma # nasm # executable: '{}'".format(nasm_executable))
+
+        elif pragma.pragma_id == TAG_PRAGMA_NATIVE:
+            if TAG_PRAGMA_TOKEN_KEY_MODEL not in pragma.options or not pragma.options[TAG_PRAGMA_TOKEN_KEY_MODEL]:
+                raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, token: '{}' not given.".format(config_proto, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_MODEL))
+            native_model = pragma.options[TAG_PRAGMA_TOKEN_KEY_MODEL]
+            if native_model in [TAG_NATIVE_MODELS_DETECTION_DISABLED, TAG_NATIVE_MODELS_DETECTION_OPTIONAL, TAG_NATIVE_MODELS_DETECTION_AUTO]:
+                native_model_mode = native_model
+            else:
+                native_model_mode = TAG_NATIVE_MODELS_DETECTION_CONFIG
+                native_model_value = native_model
+
+        elif pragma.pragma_id == TAG_PRAGMA_TOOLSET:
+            if TAG_PRAGMA_TOKEN_KEY_MODULE not in pragma.options or not pragma.options[TAG_PRAGMA_TOKEN_KEY_MODULE]:
+                raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, token: '{}' not given.".format(config_proto, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_MODULE))
+            toolset_name = pragma.options[TAG_PRAGMA_TOKEN_KEY_MODULE]
+            toolset_subtype = None
+            if toolset_name == 'mingw':
+                toolset_subtype = 'mingw'
+                toolset_name = 'gcc'
+            elif toolset_name == 'xtools':
+                toolset_subtype = 'xtools'
+                toolset_name = 'gcc'
+            mod_toolset = imported_toolset_modules.get(toolset_name)
+            if mod_toolset is None:
+                toolset_module_name = '{}.toolset_{}'.format(__package__, toolset_name)
+                try:
+                    mod_toolset = importlib.import_module(toolset_module_name)
+                    imported_toolset_modules[toolset_name] = mod_toolset
+                except ImportError:
+                    raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, got unknown toolset module: '{}'.".format(config_proto, pragma.lineno, toolset_name))
+            del pragma.options[TAG_PRAGMA_TOKEN_KEY_MODULE]
+
+            toolset_model_aliases = {}
+            if TAG_PRAGMA_TOKEN_KEY_ALIAS in pragma.options and pragma.options[TAG_PRAGMA_TOKEN_KEY_ALIAS]:
+                model_aliases = pragma.options[TAG_PRAGMA_TOKEN_KEY_ALIAS]
+                del pragma.options[TAG_PRAGMA_TOKEN_KEY_ALIAS]
+                aliases_arch_list, toolset_model_aliases = parse_arch_specific_tokens(model_aliases, TAG_ALL_KNOWN_ARCH_LIST, allow_empty_tokens=False, arch_substitutions=arch_substitutions)
+                if not aliases_arch_list:
+                    raise BuildSystemException("Can't process makefile: '{}', instruction #pragma at line: {}, token '{}' is malformed: '{}'".format(config_proto, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_ALIAS, model_aliases))
+
+            conf = _ToolsetPragmaConfig(toolset_name, pragma.lineno, pragma.options, toolset_subtype, toolset_model_aliases)
+            toolset_init_requests.append(conf)
+
+        elif pragma.pragma_id == TAG_PRAGMA_DEFAULT_MODELS:
+            if pragma.os_name == TAG_PRAGMA_OS_VALUE_ALL:
+                raise BuildSystemException("Can't process makefile: '{}', instruction #pragma at line: {}, token '{}' must be OS specific.".format(config_proto, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_MODEL))
+            if TAG_PRAGMA_TOKEN_KEY_MODEL not in pragma.options or not pragma.options[TAG_PRAGMA_TOKEN_KEY_MODEL]:
+                raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, token: '{}' not given.".format(config_proto, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_MODEL))
+            pragma_default_models = pragma.options[TAG_PRAGMA_TOKEN_KEY_MODEL]
+            arch_list_with_default_models, default_models_per_arch = parse_arch_specific_tokens(pragma_default_models, TAG_ALL_KNOWN_ARCH_LIST, allow_empty_tokens=False, arch_substitutions=arch_substitutions)
+            if not arch_list_with_default_models:
+                raise BuildSystemException("Can't process makefile: '{}', instruction #pragma at line: {}, token '{}' is malformed: '{}'".format(config_proto, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_MODEL, pragma_default_models))
+            if verbose:
+                print("BUILDSYS: #pragma line: {:2} # {} # {}".format(pragma.lineno, 'default models', pragma_default_models))
 
     if not toolset_init_requests:
         raise BuildSystemException("Can't load makefile: '{}', no #pragma instructions are given for any toolset configuration on current platform: {}.".format(config_proto, sys_platform))
