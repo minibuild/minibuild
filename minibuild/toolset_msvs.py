@@ -24,8 +24,9 @@ from .error_utils import BuildSystemException
 from .nasm_action import NasmSourceBuildAction
 from .os_utils import *
 from .string_utils import escape_string, argv_to_rsp
-from .toolset_base import ToolsetBase, ToolsetModel
+from .toolset_base import ToolsetBase, ToolsetModel, ToolsetActionBase, ToolsetActionResult
 from .winapi_level import *
+from .winrc_manifest import WINRC_MANIFEST
 
 
 WINDOWS_SDKS_REG_LANDMARK = 'SOFTWARE\\Microsoft\\Microsoft SDKs\\Windows'
@@ -34,6 +35,7 @@ MSVS_COMPILER_EXECUTABLE = 'cl.exe'
 MSVS_LINKER_EXECUTABLE = 'link.exe'
 MSVS_LIB_EXECUTABLE = 'lib.exe'
 MSVS_MANIFEST_TOOL = 'mt.exe'
+MSVS_RC_EXECUTABLE = 'rc.exe'
 MSVS_ASM_TOOL = 'ml.exe'
 MSVS_ASM64_TOOL = 'ml64.exe'
 
@@ -53,6 +55,7 @@ TAG_MSVS_MT   = 'mt'
 TAG_MSVS_LIB  = 'lib'
 TAG_MSVS_LINK = 'link'
 TAG_MSVS_ASM  = 'ml'
+TAG_MSVS_RC   = 'rc'
 
 
 def program_files_x86_path():
@@ -220,6 +223,7 @@ def map_msvs_tools_info(sdk_home, cl_path32, cl_path64, is_on_win64, msvs_versio
             (TAG_MSVS_LINK, MSVS_LINKER_EXECUTABLE, MSVS_LINKER_EXECUTABLE, False, False),
             (TAG_MSVS_ASM, MSVS_ASM_TOOL, MSVS_ASM64_TOOL, False, False),
             (TAG_MSVS_MT, MSVS_MANIFEST_TOOL, MSVS_MANIFEST_TOOL, True, True),
+            (TAG_MSVS_RC, MSVS_RC_EXECUTABLE, MSVS_RC_EXECUTABLE, True, True)
         ]:
         tool_path32 = os.path.join(bin32_home, tool32)
         tool_path64 = os.path.join(bin64_home, tool64)
@@ -455,28 +459,28 @@ def apply_environ_patch(env_patch=None):
     return custom_env
 
 
-class MasmSourceBuildAction:
+class MasmSourceBuildAction(ToolsetActionBase):
     def __init__(self, ml_path, env, sysinfo, description, asm_file_path, obj_directory, obj_name, build_model, build_config):
         self.ml = ml_path
         self.env = env
         self.asm_path = asm_file_path
-        self.obj_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_OBJ_SUFFIX]]))
+        self.obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
         self.include_dirs = eval_include_dirs_in_description(description, sysinfo[TAG_CFG_DIR_PROJECT_ROOT], BUILD_TYPE_ASM)
         self.definitions = eval_definitions_list_in_description(description, build_model, BUILD_TYPE_ASM)
         self.extra_deps = []
         self.extra_deps.extend(description.self_file_parts)
 
-    def __call__(self, force, verbose):
+    def execute(self, output, ctx):
         target_is_ready = False
-        if not force:
-            target_is_ready, _ = is_target_up_to_date(self.obj_path, [self.asm_path], self.extra_deps, verbose)
+        if not ctx.force:
+            target_is_ready, _ = is_target_up_to_date(self.obj_path, [self.asm_path], self.extra_deps, ctx.verbose)
         if target_is_ready:
-            if verbose:
-                print("BUILDSYS: up-to-date: {}".format(self.asm_path))
-            return False
+            if ctx.verbose:
+                output.report_message("BUILDSYS: up-to-date: {}".format(self.asm_path))
+            return ToolsetActionResult(rebuilt=False, artifacts=None)
 
-        if verbose:
-            print("BUILDSYS: ASM: {}".format(self.asm_path))
+        if ctx.verbose:
+            output.report_message("BUILDSYS: ASM: {}".format(self.asm_path))
 
         argv = [self.ml, '/c', '/nologo']
 
@@ -488,24 +492,19 @@ class MasmSourceBuildAction:
 
         argv += [ '/Fo{}'.format(self.obj_path), self.asm_path]
 
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-        p = subprocess.Popen(argv, env=self.env)
-        p.communicate()
-        if p.returncode != 0:
-            raise BuildSystemException(self.asm_path, exit_code=p.returncode)
-        return True
+        ctx.subprocess_communicate(output, argv, issuer=self.asm_path, env=self.env)
+        return ToolsetActionResult(rebuilt=True, artifacts=None)
 
 
-class SourceBuildActionMSVS:
+class SourceBuildActionMSVS(ToolsetActionBase):
     def __init__(self, cl_path, env, sysinfo, description, source_path, source_type, obj_directory, obj_name, build_model, build_config):
         self.cl = cl_path
         self.env = env
         self.source_path = source_path
         self.source_type = source_type
-        self.pdb_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_PDB_SUFFIX]]))
-        self.obj_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_OBJ_SUFFIX]]))
-        self.dep_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_DEP_SUFFIX]]))
+        self.pdb_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_PDB_SUFFIX])
+        self.obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
+        self.dep_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_DEP_SUFFIX])
         self.project_root = sysinfo[TAG_CFG_DIR_PROJECT_ROOT]
         self.common_prefix = sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX]
         self.build_config = build_config
@@ -519,20 +518,20 @@ class SourceBuildActionMSVS:
         self.extra_deps = []
         self.extra_deps.extend(description.self_file_parts)
 
-    def __call__(self, force, verbose):
+    def execute(self, output, ctx):
         target_is_ready = False
-        if not force:
-            target_is_ready = is_target_with_deps_up_to_date(self.project_root, self.source_path, self.obj_path, self.dep_path, self.extra_deps, verbose)
+        if not ctx.force:
+            target_is_ready = is_target_with_deps_up_to_date(self.project_root, self.source_path, self.obj_path, self.dep_path, self.extra_deps, ctx.verbose)
         if target_is_ready:
-            if verbose:
-                print("BUILDSYS: up-to-date: {}".format(self.source_path))
-            return False
+            if ctx.verbose:
+                output.report_message("BUILDSYS: up-to-date: {}".format(self.source_path))
+            return ToolsetActionResult(rebuilt=False, artifacts=None)
 
-        if verbose:
+        if ctx.verbose:
             if self.source_type == BUILD_TYPE_CPP:
-                print("BUILDSYS: CXX: {}".format(self.source_path))
+                output.report_message("BUILDSYS: CXX: {}".format(self.source_path))
             else:
-                print("BUILDSYS: C: {}".format(self.source_path))
+                output.report_message("BUILDSYS: C: {}".format(self.source_path))
 
         argv = [self.cl, '/c', '/nologo', '/showIncludes']
         if self.source_type == BUILD_TYPE_CPP:
@@ -567,27 +566,22 @@ class SourceBuildActionMSVS:
 
         argv += [ '/Fo{}'.format(self.obj_path), '/Fd{}'.format(self.pdb_path), self.source_path ]
 
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-        p = subprocess.Popen(argv, env=self.env, stdout=subprocess.PIPE, universal_newlines=True)
+        depends = ctx.subprocess_communicate(output, argv, issuer=self.source_path, env=self.env, output_filter=self.msvs_headers_filter)
 
-        stdout_data, _ = p.communicate()
-        depends = self._parse_stdout(stdout_data, p.returncode)
-        if p.returncode != 0:
-            raise BuildSystemException(self.source_path, exit_code=p.returncode)
         with open(self.dep_path, mode='wt') as dep_content:
             dep_content.writelines(['[\n'])
             for dep_item in depends:
                 dep_content.writelines(['    "', escape_string(dep_item), '",\n'])
             dep_content.writelines([']\n'])
-        return True
+        return ToolsetActionResult(rebuilt=True, artifacts=None)
 
-    def _parse_stdout(self, stdout_data, return_code):
+    def msvs_headers_filter(self, stdout_data, return_code):
         depends = []
+        output = []
         common_prefix_len = len(self.common_prefix)
         for line in stdout_data.splitlines():
             if not line.startswith(MSVS_DEP_MARK):
-                print(line)
+                output.append(line)
                 continue
             if return_code != 0:
                 continue
@@ -597,53 +591,63 @@ class SourceBuildActionMSVS:
                 continue
             dep_item = dep_source[common_prefix_len:]
             depends.append(dep_item)
-        return depends
+        return depends, '\n'.join(output)
 
 
-class StaticLibLinkActionMSVS:
+class StaticLibLinkActionMSVS(ToolsetActionBase):
     def __init__(self, lib_tool, env, sysinfo, description, lib_directory, obj_directory, obj_names, build_model, build_config):
         self.lib_tool = lib_tool
         self.env = env
-        self.outlib_path = os.path.join(lib_directory, ''.join([description.module_name, '.lib']))
+        self.outlib_path = os.path.join(lib_directory, description.module_name + '.lib')
         self.module_name = description.module_name
-        self.rsp_file = os.path.join(obj_directory, '{}.rsplnk'.format(self.module_name))
+        self.rsp_file = os.path.join(obj_directory, self.module_name + '.rsplnk')
         self.obj_list = []
         self.primary_deps = []
 
         for obj_name in obj_names:
-            obj_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_OBJ_SUFFIX]]))
+            obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
             self.obj_list.append(obj_path)
             self.primary_deps.append(obj_path)
 
         self.extra_deps = []
         self.extra_deps.extend(description.self_file_parts)
 
-    def __call__(self, force, verbose):
+    def execute(self, output, ctx):
         build_result = [BuildArtifact(BUILD_RET_TYPE_LIB, self.outlib_path, BUILD_RET_ATTR_DEFAULT)]
         target_is_ready = False
-        if not force:
-            target_is_ready, _ = is_target_up_to_date(self.outlib_path, self.primary_deps, self.extra_deps, verbose)
+        if not ctx.force:
+            target_is_ready, _ = is_target_up_to_date(self.outlib_path, self.primary_deps, self.extra_deps, ctx.verbose)
         if target_is_ready:
-            print("BUILDSYS: up-to-date: '{}', LIB: {}".format(self.module_name, self.outlib_path))
-            return (False, build_result)
+            output.report_message("BUILDSYS: up-to-date: '{}', LIB: {}".format(self.module_name, self.outlib_path))
+            return ToolsetActionResult(rebuilt=False, artifacts=build_result)
 
+        output.report_message("BUILDSYS: create LIB module '{}' ...".format(self.module_name))
         argv = [self.lib_tool, '/nologo', '/out:{}'.format(self.outlib_path)] + self.obj_list
- 
-        print("BUILDSYS: Create LIB module '{}' ...".format(self.module_name))
         argv = argv_to_rsp(argv, self.rsp_file)
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-        p = subprocess.Popen(argv, env=self.env)
-        p.communicate()
-        if p.returncode != 0:
-            raise BuildSystemException(self.outlib_path, exit_code=p.returncode)
-        return (True, build_result)
+        ctx.subprocess_communicate(output, argv, issuer=self.outlib_path, env=self.env)
+        return ToolsetActionResult(rebuilt=True, artifacts=build_result)
 
 
-class LinkActionMSVS:
-    def __init__(self, link_tool, mt_tool, env, sysinfo, loader, description, exe_directory, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config):
+def rc_tool_output_filter(stdout_data, return_code):
+    output = []
+    idx = 0
+    for line in stdout_data.splitlines():
+        line = line.rstrip('\r\n').strip()
+        if not line:
+            continue
+        idx += 1
+        if idx == 1 or idx == 2:
+            if 'Microsoft' in line:
+                continue
+        output.append(line)
+    return None, '\n'.join(output)
+
+
+class LinkActionMSVS(ToolsetActionBase):
+    def __init__(self, link_tool, mt_tool, rc_tool, env, sysinfo, loader, description, exe_directory, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config):
         self.linker = link_tool
         self.mt_tool = mt_tool
+        self.rc_tool = rc_tool
         self.env = env
         self.sharedlib_directory = sharedlib_directory
         self.is_dll = True if exe_directory is None else False
@@ -655,7 +659,6 @@ class LinkActionMSVS:
         self.extra_deps = []
         self.extra_deps.extend(description.self_file_parts)
         self.use_wmain = description.wmain
-        self.win_console = description.win_console
         self.win_stack_size = description.win_stack_size
         self.zip_section = None
 
@@ -664,16 +667,20 @@ class LinkActionMSVS:
             self.zip_section = zip_section_file
             self.primary_deps.append(zip_section_file)
 
+        self.module_name = description.module_name
+        self.module_name_private = description.module_name
+
         if self.is_dll:
-            self.bin_basename = ''.join([description.module_name, '.dll'])
-            self.implib_basename = ''.join([description.module_name, '.lib'])
-            self.pdb_basename = ''.join([description.module_name, '.pdb'])
+            self.bin_basename = description.module_name + '.dll'
+            self.implib_basename = description.module_name + '.lib'
+            self.pdb_basename = description.module_name + '.pdb'
         else:
             exe_name = description.module_name
             if description.exe_name:
                 exe_name = description.exe_name
-            self.bin_basename = ''.join([exe_name, '.exe'])
-            self.pdb_basename = ''.join([exe_name, '.pdb'])
+                self.module_name_private = description.exe_name
+            self.bin_basename = exe_name + '.exe'
+            self.pdb_basename = exe_name + '.pdb'
 
         self.bin_path_public = os.path.join(self.link_public_dir, self.bin_basename)
         self.bin_path_private = os.path.join(self.link_private_dir, self.bin_basename)
@@ -688,46 +695,72 @@ class LinkActionMSVS:
                 self.extra_deps.append(self.exports_def_file)
             self.export_list = description.export
 
-        self.manifest_stub = os.path.join(self.link_private_dir, ''.join([description.module_name, '.manifest-stub']))
-        self.manifest_builtin = os.path.join(self.link_private_dir, ''.join([description.module_name, '.manifest']))
-        self.module_name = description.module_name
-        self.rsp_file = os.path.join(self.link_private_dir, '{}.rsplnk'.format(self.module_name))
+        self.res_file = None
+        self.include_dirs = None
+        self.winrc_file = verify_winrc_file(description)
+        if self.winrc_file is not None:
+            self.include_dirs = eval_include_dirs_in_description(description, sysinfo[TAG_CFG_DIR_PROJECT_ROOT], None)
+            self.extra_deps.append(self.winrc_file)
+            self.res_file = os.path.join(self.link_private_dir, self.module_name_private + '.res')
+            self.winrc_definitions = description.winrc_definitions
+
+        if description.with_default_manifest:
+            self.manifest_stub = os.path.join(self.link_private_dir, self.module_name_private + '.manifest-stub')
+            self.manifest_builtin = os.path.join(self.link_private_dir, self.module_name_private + '.manifest')
+        else:
+            self.manifest_stub = None
+            self.manifest_builtin = None
+        self.rsp_file = os.path.join(self.link_private_dir, self.module_name_private + '.rsplnk')
         self.obj_list = []
         self.build_config = build_config
         for obj_name in obj_names:
-            obj_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_OBJ_SUFFIX]]))
+            obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
             self.obj_list.append(obj_path)
             self.primary_deps.append(obj_path)
         self.link_libstatic_names = []
         self.link_libshared_names = []
-        eval_libnames_in_description(loader, description, self.link_libstatic_names, self.link_libshared_names)
+        eval_libnames_in_description(loader, description, build_model, self.link_libstatic_names, self.link_libshared_names)
         self.prebuilt_lib_names = eval_prebuilt_lib_list_in_description(description, build_model)
         self.linker_options = []
         self.linker_options += build_model.get_linker_options()
+        os_version = build_model.get_os_version()
+        if description.win_console:
+            self.linker_options += ['/SUBSYSTEM:CONSOLE,{}'.format(os_version)]
+        else:
+            self.linker_options += ['/SUBSYSTEM:WINDOWS,{}'.format(os_version)]
 
-    def __call__(self, force, verbose):
+    def execute(self, output, ctx):
         mod_type_id = BUILD_RET_TYPE_DLL if self.is_dll else BUILD_RET_TYPE_EXE
         build_result = [BuildArtifact(mod_type_id, self.bin_path_public, BUILD_RET_ATTR_DEFAULT), BuildArtifact(BUILD_RET_TYPE_PDB, self.pdb_path_public, BUILD_RET_ATTR_DEFAULT)]
         if self.is_dll:
             build_result += [BuildArtifact(BUILD_RET_TYPE_LIB, self.implib_path_public, BUILD_RET_ATTR_DEFAULT)]
         target_is_ready = False
-        if not force:
-            target_is_ready, _ = is_target_up_to_date(self.bin_path_public, self.primary_deps, self.extra_deps, verbose)
+        if not ctx.force:
+            target_is_ready, _ = is_target_up_to_date(self.bin_path_public, self.primary_deps, self.extra_deps, ctx.verbose)
         mod_type = 'DLL' if self.is_dll else 'EXE'
         if target_is_ready:
-            print("BUILDSYS: up-to-date: '{}', {}: {}".format(self.module_name, mod_type, self.bin_path_public))
-            return (False, build_result)
+            output.report_message("BUILDSYS: up-to-date: '{}', {}: {}".format(self.module_name, mod_type, self.bin_path_public))
+            return ToolsetActionResult(rebuilt=False, artifacts=build_result)
 
-        print("BUILDSYS: Link {} module '{}' ...".format(mod_type, self.module_name))
+        output.report_message("BUILDSYS: link {} module '{}' ...".format(mod_type, self.module_name))
         for built_item_info in build_result:
             if os.path.exists(built_item_info.path):
-                if verbose:
-                    print("BUILDSYS: remove file: {}".format(built_item_info.path))
+                if ctx.verbose:
+                    output.report_message("BUILDSYS: remove file: {}".format(built_item_info.path))
                 os.remove(built_item_info.path)
         cleanup_dir(self.link_private_dir)
         link_stamp_file_tmp = self.link_stamp_file + '.tmp'
         with open(link_stamp_file_tmp, mode='wb'):
             pass
+
+        if self.winrc_file is not None:
+            argv = [self.rc_tool, '/r', '/fo{}'.format(self.res_file)]
+            for incd in self.include_dirs:
+                argv += [ '/i{}'.format(incd) ]
+            for defrc in self.winrc_definitions:
+                argv += [ '/d{}'.format(defrc) ]
+            argv += [self.winrc_file]
+            ctx.subprocess_communicate(output, argv, issuer=self.winrc_file, env=self.env, output_filter=rc_tool_output_filter, title=os.path.basename(self.winrc_file))
 
         argv = [self.linker, '/nologo', '/incremental:no']
         argv += ['/debug', '/pdb:{}'.format(self.pdb_path_private)]
@@ -740,6 +773,9 @@ class LinkActionMSVS:
             raise BuildSystemException("Unsupported build config: '{}'".format(self.build_config))
 
         argv += [ '-out:{}'.format(self.bin_path_private)]
+
+        if self.res_file is not None:
+            argv += [ self.res_file ]
 
         if self.obj_list:
             argv += self.obj_list
@@ -762,8 +798,6 @@ class LinkActionMSVS:
 
         argv += self.linker_options
 
-        argv += ['/manifest', '/manifestfile:{}'.format(self.manifest_stub)]
-
         if self.is_dll:
             argv += ['/dll', '/implib:{}'.format(self.implib_path_private) ]
             if self.exports_def_file is not None:
@@ -772,38 +806,27 @@ class LinkActionMSVS:
                 for export_entry in self.export_list:
                     argv += ['/EXPORT:{}'.format(export_entry)]
         else:
-            if self.win_console:
-                argv += ['/subsystem:console']
-            else:
-                argv += ['/subsystem:windows']
             if self.use_wmain:
                 argv += ['/ENTRY:wmainCRTStartup']
             if self.win_stack_size:
                 argv += ['/STACK:{}'.format(self.win_stack_size)]
 
         argv = argv_to_rsp(argv, self.rsp_file)
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-        p = subprocess.Popen(argv, env=self.env)
-        p.communicate()
-        if p.returncode != 0:
-            raise BuildSystemException(self.bin_path_private, exit_code=p.returncode)
+        ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private, env=self.env)
 
-        manifest_id = '2' if self.is_dll else '1'
-        argv = [self.mt_tool, '/nologo', '/verbose', '/manifest', self.manifest_stub,
-                '/out:{}'.format(self.manifest_builtin), '/outputresource:{};{}'.format(self.bin_path_private, manifest_id) ]
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-        p = subprocess.Popen(argv, env=self.env)
-        p.communicate()
-        if p.returncode != 0:
-            raise BuildSystemException(bin_path, exit_code=p.returncode)
+        if self.manifest_stub is not None:
+            with open(self.manifest_stub, mode='wt') as fh_manifest:
+                fh_manifest.writelines([WINRC_MANIFEST])
+            manifest_id = '2' if self.is_dll else '1'
+            argv = [self.mt_tool, '/nologo', '/verbose', '/manifest', self.manifest_stub,
+                    '/out:{}'.format(self.manifest_builtin), '/outputresource:{};{}'.format(self.bin_path_private, manifest_id) ]
+            ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private, env=self.env, title=os.path.basename(self.manifest_builtin))
 
         if self.zip_section is not None:
             if not os.path.isfile(self.zip_section):
                 raise BuildSystemException("File '{}' for zip-section not found".format(self.zip_section))
-            if verbose:
-                print("BUILDSYS: EXEC: {} << {}".format(self.bin_path_private, self.zip_section))
+            if ctx.verbose:
+                output.report_message("BUILDSYS: EXEC: {} << {}".format(self.bin_path_private, self.zip_section))
             with open(self.bin_path_private, 'ab') as fhbin:
                 with open(self.zip_section, 'rb') as fhzip:
                     shutil.copyfileobj(fhzip, fhbin)
@@ -816,7 +839,7 @@ class LinkActionMSVS:
         os.utime(self.link_stamp_file, None)
         os.utime(self.bin_path_public, None)
 
-        return (True, build_result)
+        return ToolsetActionResult(rebuilt=True, artifacts=build_result)
 
 
 def _winapi_level_to_compiler_defines(api_level):
@@ -832,8 +855,10 @@ class MsvsModelWin32(ToolsetModel):
     def __init__(self, msvs_version, api_level):
         ToolsetModel.__init__(self)
         self._name = MSVS_MODEL_FORMAT_WIN32.format(msvs_version)
+        self._version = msvs_version
         self._is_native = is_windows_32bit()
         self._arch_defines = _winapi_level_to_compiler_defines(api_level)
+        self._os_version = IMPLIED_WINDOWS_SUBSYSTEM_VALUES[api_level]
 
     @property
     def model_name(self):
@@ -851,6 +876,10 @@ class MsvsModelWin32(ToolsetModel):
     def architecture_abi_name(self):
         return TAG_ARCH_X86
 
+    @property
+    def toolset_version(self):
+        return self._version
+
     def is_native(self):
         return self._is_native
 
@@ -860,13 +889,18 @@ class MsvsModelWin32(ToolsetModel):
     def get_linker_options(self):
         return ['/MACHINE:X86']
 
+    def get_os_version(self):
+        return self._os_version
+
 
 class MsvsModelWin64(ToolsetModel):
     def __init__(self, msvs_version, api_level):
         ToolsetModel.__init__(self)
         self._name = MSVS_MODEL_FORMAT_WIN64.format(msvs_version)
+        self._version = msvs_version
         self._is_native = is_windows_64bit()
         self._arch_defines = _winapi_level_to_compiler_defines(api_level)
+        self._os_version = IMPLIED_WINDOWS_SUBSYSTEM_VALUES[api_level]
 
     @property
     def model_name(self):
@@ -884,6 +918,10 @@ class MsvsModelWin64(ToolsetModel):
     def architecture_abi_name(self):
         return TAG_ARCH_X86_64
 
+    @property
+    def toolset_version(self):
+        return self._version
+
     def is_native(self):
         return self._is_native
 
@@ -893,6 +931,8 @@ class MsvsModelWin64(ToolsetModel):
     def get_linker_options(self):
         return ['/MACHINE:X64']
 
+    def get_os_version(self):
+        return self._os_version
 
 class ToolsetMSVS(ToolsetBase):
     def __init__(self, msvs_version, sysinfo, loader, nasm_executable,
@@ -965,7 +1005,7 @@ class ToolsetMSVS(ToolsetBase):
                 try:
                     subprocess.check_output([self._nasm_executable, '-v'], stderr=subprocess.STDOUT)
                     self._nasm_checked = True
-                except Exception as _:
+                except Exception:
                     pass
             if not self._nasm_checked:
                 raise BuildSystemException("NASM executable '{}' is not ready, it is required to compile: '{}'".format(self._nasm_executable, asm_source))
@@ -984,14 +1024,16 @@ class ToolsetMSVS(ToolsetBase):
     def create_exe_link_action(self, description, exe_directory, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config):
         link_tool = self._select_tool(TAG_MSVS_LINK, build_model)
         mt_tool = self._select_tool(TAG_MSVS_MT, build_model)
+        rc_tool = self._select_tool(TAG_MSVS_RC, build_model)
         env = self._select_env(build_model)
-        return LinkActionMSVS(link_tool, mt_tool, env, self._sysinfo, self._loader, description, exe_directory, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config)
+        return LinkActionMSVS(link_tool, mt_tool, rc_tool, env, self._sysinfo, self._loader, description, exe_directory, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config)
 
     def create_lib_shared_link_action(self, description, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config):
         link_tool = self._select_tool(TAG_MSVS_LINK, build_model)
         mt_tool = self._select_tool(TAG_MSVS_MT, build_model)
+        rc_tool = self._select_tool(TAG_MSVS_RC, build_model)
         env = self._select_env(build_model)
-        return LinkActionMSVS(link_tool, mt_tool, env, self._sysinfo, self._loader, description, None, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config)
+        return LinkActionMSVS(link_tool, mt_tool, rc_tool, env, self._sysinfo, self._loader, description, None, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config)
 
 
 def create_toolset(sysinfo, loader, **kwargs):
@@ -1031,10 +1073,12 @@ def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs
     version = kwargs.get('version')
     nasm_executable = kwargs.get('nasm_executable')
     arch = kwargs.get('arch')
+    required = kwargs.get('required', 0)
     if not version:
         raise BuildSystemException("Can't process makefile: '{}', line: {}\n  MSVS version is not specified.".format(config_proto, pragma_line))
     msvs_version = None
     supported = []
+    detected = 0
     if version == 'latest':
         for probe_info in reversed(MSVS_VERSIONS_MAPPING):
             version_title = probe_info[0]
@@ -1046,16 +1090,27 @@ def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs
                 msvs_version = version_title
                 break
         if msvs_version is None:
+            if not required:
+                print("BUILDSYS: makefile: '{}', line: {}\n  Can't find any supported version of MSVS toolset on this machine, tried: {}".format(config_proto, pragma_line, ','.join(supported)))
+                return None, None, None, None
             raise BuildSystemException("Can't process makefile: '{}', line: {}\n  Can't find any supported version of MSVS toolset on this machine, tried: {}".format(config_proto, pragma_line, ','.join(supported)))
     else:
         for probe_info in MSVS_VERSIONS_MAPPING:
             version_title = probe_info[0]
+            probe_args = probe_info[1]
+            probe = probe_info[2]
             supported.append(version_title)
             if version_title == version:
+                detected = probe(*probe_args)
                 msvs_version = version_title
                 break
         if msvs_version is None:
             raise BuildSystemException("Can't process makefile: '{}', line: {}\n  Requested MSVS version: '{}' is not in list of supported versions: {}".format(config_proto, pragma_line, version, ','.join(supported)))
+        if not detected:
+            if not required:
+                print("BUILDSYS: makefile: '{}', line: {}\n  Requested MSVS version: '{}' is not found on this machine".format(config_proto, pragma_line, msvs_version))
+                return None, None, None, None
+            raise BuildSystemException("Can't process makefile: '{}', line: {}\n  Requested MSVS version: '{}' is not found on this machine".format(config_proto, pragma_line, msvs_version))
     win32_api_level = None
     win64_api_level = None
     if arch:

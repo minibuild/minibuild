@@ -1,6 +1,7 @@
 from __future__ import print_function
 import argparse
 import importlib
+import multiprocessing
 import os
 import os.path
 import platform
@@ -12,7 +13,8 @@ from .build_description import BuildDescriptionLoader
 from .build_workflow import BuildWorkflow
 from .config_ini import *
 from .constants import *
-from .error_utils import BuildSystemException
+from .error_utils import BuildSystemException, BuildSystemSysExit, buildsys_error_to_string
+from .faccess_emerge import perform_faccess_emerge
 from .gen_bconf import generate_build_config
 from .os_utils import *
 from .pragma_tokens import load_buildconf_pragmas, makefile_is_project_landmark
@@ -131,6 +133,16 @@ def auto_eval_native_model(used_model_name, toolset_models_mapping, required, ve
                         native_models_from_same_toolset.append(model_name)
 
         native_models_variants = native_models_from_same_toolset if native_models_from_same_toolset else native_models_all
+
+        if len(native_models_variants) > 1:
+            native_models_cross = []
+            for model_name in native_models_variants:
+                toolset, _ = toolset_models_mapping[model_name]
+                model = toolset.supported_models[model_name]
+                if model.is_crosstool():
+                    native_models_cross.append(model_name)
+            if len(native_models_cross) == 1:
+                native_models_variants = native_models_cross
 
         if not native_models_variants:
             if required:
@@ -271,8 +283,18 @@ class PassThroughCommandList:
         self.items.append(item)
 
 
+def guess_parallelism():
+    processors_count = multiprocessing.cpu_count()
+    if processors_count in [0, 1]:
+        return 2
+    elif processors_count == 2:
+        return 3
+    return processors_count + 2
+
+
 def create_build_workflow(frozen, build_directory, verbose, argv):
     buildsys_error = None
+    sysinfo = None
     toolset_choices = []
     model_aliases = {}
     try:
@@ -326,6 +348,7 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
         static_lib_dir = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_LIB_DIR))
         shared_lib_dir = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_SHARED_DIR))
         public_dir     = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_PUBLIC_DIR))
+        faccess_dir    = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_FACCESS_DIR))
 
         mkdir_safe(bootstrap_dir)
         mkdir_safe(obj_dir)
@@ -336,7 +359,9 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
         sysinfo = {
             TAG_CFG_FROZEN: frozen,
             TAG_CFG_DIR_PROJECT_ROOT: project_root,
-            TAG_CFG_PROJECT_ROOT_COMMON_PREFIX: ''.join([os.path.normcase(project_root), os.path.sep]),
+            TAG_CFG_DIR_PROJECT_OUTPUT: output_dname,
+            TAG_CFG_PROJECT_ROOT_COMMON_PREFIX: os.path.normcase(project_root) + os.path.sep,
+            TAG_CFG_PROJECT_OUTPUT_COMMON_PREFIX : os.path.normcase(output_dname) + os.path.sep,
             TAG_CFG_DIR_BOOTSTRAP: bootstrap_dir,
             TAG_CFG_DIR_OBJ: obj_dir,
             TAG_CFG_DIR_EXE: exe_dir,
@@ -344,6 +369,7 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
             TAG_CFG_DIR_LIB: static_lib_dir,
             TAG_CFG_DIR_SHARED: shared_lib_dir,
             TAG_CFG_DIR_PUBLIC: public_dir,
+            TAG_CFG_DIR_FACCESS: faccess_dir,
             TAG_CFG_OBJ_SUFFIX : '.obj',
             TAG_CFG_PDB_SUFFIX : '.pdb',
             TAG_CFG_DEP_SUFFIX : '.dep',
@@ -426,19 +452,26 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
     else:
         models_help = 'build model'
 
+    parallelism = guess_parallelism()
+
     parser = ArgumentParser(prog='minibuild', formatter_class=ArgumentParserFormat)
     parser.add_argument('--model',     nargs='?', help=models_help)
     parser.add_argument('--config',    nargs='?', choices=BUILD_CONFIG_ALL, default=BUILD_CONFIG_RELEASE, help='build configuration')
     parser.add_argument('--directory', nargs='?', help='startup directory for build')
+    parser.add_argument('-j', '--parallel', nargs='?', default=parallelism, metavar='N', type=int, help='R|run N jobs in parallel\n    default={}, derived from CPUs available'.format(parallelism))
     parser.add_argument('--pass',      action='store_true', dest='pass_through', help='proceed with command-lines from makefile')
     parser.add_argument('--force',     choices=[-1,0,1,2],  default=0, type=int,
         help='R|implied rebuild level (default is 0)\n   -1: skip build of dependent targets\n    0: as needed\n    1: force rebuild of current module only\n    2: force rebuild of all targets')
-    parser.add_argument('--public',    action='store_true', help='when building composite target publish it as zip/tgz')
+    parser.add_argument('--public',    action='store_true', help='when building composite target, publish it as zip/tgz')
     parser.add_argument('--public-format', nargs='?', choices=['auto'] + TAG_PUBLIC_FORMAT_ALL[:], default='auto',
         help="public format, default is 'auto', i.e. 'zip' when target is built for Windows and 'tgz' otherwise")
     parser.add_argument('--public-layout', nargs='?', choices=['default', TAG_PUBLIC_LAYAOUT_FLAT], default='default',
         help="public layout, 'flat' means to avoid any subdirectories creation when publishing")
-    parser.add_argument('--verbose',   action='store_true', help='verbose output on build')
+    parser.add_argument('--trace',     action='store_true', help='show all command lines while building')
+    parser.add_argument('--verbose',   action='store_true', help='verbose output while building')
+    parser.add_argument('--faccess',   action='store_true', help="R|track all files being accessed while building,\nas result stamps of accessed files are saved\nin '<project-output>/{}' directory".format(BUILD_CONFIG_DEFAULT_FACCESS_DIR))
+    parser.add_argument('--faccess-directory', nargs='*', metavar='dirname', help="R|Directory name relative to <project-root> where to\ntrack files being accessed, default is <project-root>")
+    parser.add_argument('--faccess-emerge', action='store_true', help="R|Emerge content of '<project-output>/{}' directory\nin '<project-output>/{}' file".format(BUILD_CONFIG_DEFAULT_FACCESS_DIR, BUILD_CONFIG_DEFAULT_FACCESS_EMERGE_FILE))
     parser.add_argument('--version',   action='store_true', help='print version number and exit')
     if frozen:
         parser.add_argument('--interpreter', action='store_true', help='launch this executable as python interpreter')
@@ -452,6 +485,10 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
         print(format_version_string(frozen))
         return None, None
 
+    if args.faccess_emerge and sysinfo is not None:
+        perform_faccess_emerge(sysinfo)
+        return None, None
+
     if buildsys_error is not None:
         raise buildsys_error
 
@@ -460,6 +497,21 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
         public_format = args.public_format
 
     public_layout = TAG_PUBLIC_LAYAOUT_FLAT if args.public_layout == TAG_PUBLIC_LAYAOUT_FLAT else None
+
+    faccess_prefixes = []
+    if args.faccess:
+        if args.faccess_directory:
+            for faccess_dir_arg in args.faccess_directory:
+                faccess_dirname_abs = normalize_path_optional(faccess_dir_arg, project_root)
+                if not os.path.isdir(faccess_dirname_abs):
+                    raise BuildSystemException("Directory requested for faccess track not found: '{}'.".format(faccess_dir_arg))
+                faccess_dirname_norm_prefix = os.path.normcase(faccess_dirname_abs) + os.sep
+                if not faccess_dirname_norm_prefix.startswith(sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX]):
+                    raise BuildSystemException("Directory requested for faccess track '{}' (resolved as '{}') is out of <project-root> source tree.".format(faccess_dir_arg, faccess_dirname_abs))
+                faccess_prefixes.append(faccess_dirname_norm_prefix)
+        mkdir_safe(faccess_dir)
+        if not faccess_prefixes:
+            faccess_prefixes = [ sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX] ]
 
     if args.pass_through:
         pass_through_commands = PassThroughCommandList()
@@ -507,8 +559,11 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
 
     native_model_remap = eval_native_model(arg_model, toolset_models_mapping, config, sys_platform, sys_arch, verbose)
 
+    parallelism = args.parallel
+    if parallelism <= 0:
+        parallelism = 1
     logic = BuildWorkflow(sysinfo=sysinfo, toolset_models_mapping=toolset_models_mapping, native_model_remap=native_model_remap,
-        grammar_substitutions=subst_info)
+        grammar_substitutions=subst_info, verbose=verbose, trace=args.trace, parallelism=parallelism, faccess=args.faccess, faccess_prefixes=faccess_prefixes)
 
     for model_name in toolset_models_mapping:
         _, desc_loader = toolset_models_mapping[model_name]
@@ -523,7 +578,6 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
     build_args['public_format'] = public_format
     build_args['public_layout'] = public_layout
     build_args['rebuild_level'] = args.force
-    build_args['verbose'] = verbose
 
     return logic, build_args
 
@@ -599,20 +653,17 @@ def script_main_perform(argv_in, frozen, dir_redirect, walks, level, verbose=Non
 
 
 def script_main(argv=None, frozen=False):
-    safe = True
     try:
         if argv is None:
             argv = sys.argv[1:]
-        else:
-            safe = False
         if len(argv) == 1 and argv[0] == '--version':
             print(format_version_string(frozen))
             return 0
         walks = set()
         script_main_perform(argv, frozen, os.getcwd(), walks, 0)
         return 0
+    except BuildSystemSysExit as exc:
+        return exc.to_exit_code()
     except BuildSystemException as exc:
-        if not safe:
-            raise
-        print("BUILDSYS: ERROR: {}".format(exc))
+        print(buildsys_error_to_string(exc))
         return exc.to_exit_code()

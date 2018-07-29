@@ -1,6 +1,7 @@
 import os.path
 import re
 import sys
+import threading
 
 from .constants import *
 from .error_utils import BuildSystemException
@@ -109,7 +110,7 @@ def _load_makefile(project_root, working_dir, fname, grammar_map, subst, buildsy
     local_vars = {}
     for var_name in grammar_map:
         var_type = grammar_map[var_name][0]
-        var_value = None if var_type is None else var_type()
+        var_value = var_type() if callable(var_type) else var_type
         local_vars[var_name] = var_value
     if buildsys_builtins is not None:
         local_vars.update(buildsys_builtins)
@@ -165,6 +166,8 @@ class BuildDescriptionLoader:
         }
         self.subst = {}
         self.import_hook = None
+        self.cache = {}
+        self.lock = threading.RLock()
 
     def set_target_platform(self, value):
         self.buildsys_builtins[TAG_BUILDSYS_TARGET_PLATFORM] = value
@@ -183,30 +186,44 @@ class BuildDescriptionLoader:
     def set_import_hook(self, import_hook):
         self.import_hook = import_hook
 
-    def load_build_description(self, working_dir, required_by=None):
-        project_root = self.subst[TAG_SUBST_PROJECT_ROOT]
-        import_enabled = callable(self.import_hook)
-        grammar_tokens, imports = _load_makefile(project_root, working_dir, BUILD_MODULE_DESCRIPTION_FILE, TAG_GRAMMAR_KEYS_ALL,
-            self.subst, self.buildsys_builtins, required_by, import_enabled)
-        desc = BuildDescription(grammar_tokens)
-        if imports:
-            for dname_import_idx in imports:
-                import_origin = imports[dname_import_idx]
-                ext = self.import_hook(import_origin.dname_import, import_origin.src_file)
-                ext_name = ext.ext_name
-                if desc._buildsys_import_list is None:
-                    desc._buildsys_import_list = [ ext_name ]
-                else:
-                    desc._buildsys_import_list.append(ext_name)
-                desc._tokens[TAG_GRAMMAR_BUILTIN_SELF_FILE_PARTS].extend(ext._tokens[TAG_GRAMMAR_BUILTIN_SELF_FILE_PARTS])
-        if not desc.module_type:
-            raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_MODULE_TYPE))
-        if desc.module_type not in TAG_ALL_SUPPORTED_MODULE_TYPES:
-            raise BuildSystemException("Can't load makefile: '{}', given value '{}' of grammar token '{}' is not in list of supported values: '{}'".format(
-                desc.self_file_parts[0], desc.module_type, TAG_GRAMMAR_KEY_MODULE_TYPE, "', '".join(TAG_ALL_SUPPORTED_MODULE_TYPES)))
-        if not desc.module_name:
-            raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_MODULE_NAME))
-
+    def load_build_description(self, working_dir, model, required_by=None):
+        desc = None
+        self.lock.acquire()
+        try:
+            desc = self.cache.get(model.model_name, {}).get(working_dir)
+            if desc is None:
+                project_root = self.subst[TAG_SUBST_PROJECT_ROOT]
+                import_enabled = callable(self.import_hook)
+                buildsys_builtins = {
+                    TAG_BUILDSYS_TARGET_ARCH : model.architecture_abi_name,
+                    TAG_BUILDSYS_TOOLSET_VERSION : model.toolset_version,
+                }
+                buildsys_builtins.update(self.buildsys_builtins)
+                grammar_tokens, imports = _load_makefile(project_root, working_dir, BUILD_MODULE_DESCRIPTION_FILE, TAG_GRAMMAR_KEYS_ALL,
+                    self.subst, buildsys_builtins, required_by, import_enabled)
+                desc = BuildDescription(grammar_tokens)
+                if imports:
+                    for dname_import_idx in imports:
+                        import_origin = imports[dname_import_idx]
+                        ext = self.import_hook(import_origin.dname_import, import_origin.src_file)
+                        ext_name = ext.ext_name
+                        if desc._buildsys_import_list is None:
+                            desc._buildsys_import_list = [ ext_name ]
+                        else:
+                            desc._buildsys_import_list.append(ext_name)
+                        desc._tokens[TAG_GRAMMAR_BUILTIN_SELF_FILE_PARTS].extend(ext._tokens[TAG_GRAMMAR_BUILTIN_SELF_FILE_PARTS])
+                if not desc.module_type:
+                    raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_MODULE_TYPE))
+                if desc.module_type not in TAG_ALL_SUPPORTED_MODULE_TYPES:
+                    raise BuildSystemException("Can't load makefile: '{}', given value '{}' of grammar token '{}' is not in list of supported values: '{}'".format(
+                        desc.self_file_parts[0], desc.module_type, TAG_GRAMMAR_KEY_MODULE_TYPE, "', '".join(TAG_ALL_SUPPORTED_MODULE_TYPES)))
+                if not desc.module_name:
+                    raise BuildSystemException("Can't load makefile: '{}', grammar token '{}' is missed or empty.".format(desc.self_file_parts[0], TAG_GRAMMAR_KEY_MODULE_NAME))
+                if model.model_name not in self.cache:
+                    self.cache[model.model_name] = {}
+                self.cache[model.model_name][working_dir] = desc
+        finally:
+            self.lock.release()
         return desc
 
     def load_build_extension(self, working_dir, required_by):

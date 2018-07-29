@@ -5,6 +5,7 @@ __all__ = ['create_toolset', 'describe_toolset']
 import ctypes
 import os
 import os.path
+import re
 import shutil
 import subprocess
 import sys
@@ -17,8 +18,9 @@ from .error_utils import BuildSystemException
 from .nasm_action import NasmSourceBuildAction
 from .os_utils import *
 from .string_utils import escape_string, argv_to_rsp
-from .toolset_base import ToolsetBase, ToolsetModel
+from .toolset_base import ToolsetBase, ToolsetModel, ToolsetActionBase, ToolsetActionResult
 from .winapi_level import *
+from .winrc_manifest import WINRC_MANIFEST
 
 
 GCC_MODEL_LINUX_X86 = 'gcc-linux-x86'
@@ -56,6 +58,43 @@ CROSSTOOL_NATIVE_STATUS = {
     TAG_ARCH_ARM: is_linux_arm(),
     TAG_ARCH_ARM64: is_linux_arm64(),
 }
+
+_RE_VERSION = re.compile(r'(\d+\.[\d\.]+)')
+
+
+def split_version_string(version_text, strip_ebraced):
+    bits = version_text.split()
+    reparsed = []
+    embrased = False
+    for v in bits:
+        if v.startswith('('):
+            embrased = True
+            v = v[1:]
+        end_embrace = v.endswith(')')
+        if end_embrace:
+            v = v[:-1]
+        if not embrased or not strip_ebraced:
+            reparsed.append(v)
+        if end_embrace:
+            embrased = False
+    return reparsed
+
+
+def parse_clang_version_string(version_text):
+    for value in split_version_string(version_text, False):
+        if value.startswith('clang-'):
+            return value[6:]
+    return None
+
+
+def parse_gcc_version_string(version_text):
+    for value in split_version_string(version_text, True):
+        m = _RE_VERSION.match(value)
+        if m:
+            version = m.group(1)
+            if version:
+                return version
+    return None
 
 
 def load_export_list_from_def_file(def_file, winapi_only, for_winapi):
@@ -98,15 +137,14 @@ def load_export_list_from_def_file(def_file, winapi_only, for_winapi):
     return export_list
 
 
-
-class SourceBuildActionGCC:
+class SourceBuildActionGCC(ToolsetActionBase):
     def __init__(self, tools, sysinfo, description, source_path, source_type, obj_directory, obj_name, build_model, build_config):
         self.tools = tools
         self.source_path = source_path
         self.source_type = source_type
-        self.pdb_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_PDB_SUFFIX]]))
-        self.obj_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_OBJ_SUFFIX]]))
-        self.dep_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_DEP_SUFFIX]]))
+        self.pdb_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_PDB_SUFFIX])
+        self.obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
+        self.dep_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_DEP_SUFFIX])
         self.deptmp_path = self.dep_path + 'tmp'
         self.project_root = sysinfo[TAG_CFG_DIR_PROJECT_ROOT]
         self.common_prefix = sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX]
@@ -122,26 +160,23 @@ class SourceBuildActionGCC:
         self.extra_deps = []
         self.extra_deps.extend(description.self_file_parts)
 
-    def __call__(self, force, verbose):
+    def execute(self, output, ctx):
         target_is_ready = False
-        if not force:
+        if not ctx.force:
             target_is_ready = is_target_with_deps_up_to_date(
-                self.project_root, self.source_path, self.obj_path, self.dep_path, self.extra_deps, verbose)
+                self.project_root, self.source_path, self.obj_path, self.dep_path, self.extra_deps, ctx.verbose)
         if target_is_ready:
-            if verbose:
-                print("BUILDSYS: up-to-date: {}".format(self.source_path))
-            return False
+            if ctx.verbose:
+                output.report_message("BUILDSYS: up-to-date: {}".format(self.source_path))
+            return ToolsetActionResult(rebuilt=False, artifacts=None)
 
-        if verbose:
+        if ctx.verbose:
             if self.source_type == BUILD_TYPE_CPP:
-                print("BUILDSYS: CXX: {}".format(self.source_path))
+                output.report_message("BUILDSYS: CXX: {}".format(self.source_path))
             elif self.source_type == BUILD_TYPE_C:
-                print("BUILDSYS: C: {}".format(self.source_path))
+                output.report_message("BUILDSYS: C: {}".format(self.source_path))
             elif self.source_type == BUILD_TYPE_ASM:
-                print("BUILDSYS: ASM: {}".format(self.source_path))
-
-        if os.path.isfile(self.deptmp_path):
-            os.remove(self.deptmp_path)
+                output.report_message("BUILDSYS: ASM: {}".format(self.source_path))
 
         argv = [self.tools.gpp, '-Werror-implicit-function-declaration']
         argv += self.arch_flags
@@ -179,51 +214,45 @@ class SourceBuildActionGCC:
 
         argv += [ '-c', '-o', self.obj_path, self.source_path ]
 
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-        print(os.path.basename(self.source_path))
-        p = subprocess.Popen(argv)
-        p.communicate()
-        if p.returncode != 0:
-            raise BuildSystemException(self.source_path, exit_code=p.returncode)
+        ctx.subprocess_communicate(output, argv, issuer=self.source_path, title=os.path.basename(self.source_path))
+
         depends = parse_gnu_makefile_depends(self.common_prefix, self.source_path, self.deptmp_path, self.obj_path)
         with open(self.dep_path, mode='wt') as dep_content:
             dep_content.writelines(['[\n'])
             for dep_item in depends:
                 dep_content.writelines(['    "', escape_string(dep_item), '",\n'])
             dep_content.writelines([']\n'])
-        os.remove(self.deptmp_path)
-        return True
+        return ToolsetActionResult(rebuilt=True, artifacts=None)
 
 
-class StaticLibLinkActionGCC:
+class StaticLibLinkActionGCC(ToolsetActionBase):
     def __init__(self, tools, sysinfo, description, lib_directory, obj_directory, obj_names, build_model, build_config):
         self.tools = tools
         self.module_name = description.module_name
-        self.rsp_file = os.path.join(obj_directory, '{}.rsplnk'.format(self.module_name))
-        self.outlib_path = os.path.join(lib_directory, ''.join(['lib', self.module_name, '.a']))
+        self.rsp_file = os.path.join(obj_directory, self.module_name + '.rsplnk')
+        self.outlib_path = os.path.join(lib_directory, 'lib' + self.module_name + '.a')
         self.obj_list = []
         self.primary_deps = []
 
         for obj_name in obj_names:
-            obj_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_OBJ_SUFFIX]]))
+            obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
             self.obj_list.append(obj_path)
             self.primary_deps.append(obj_path)
 
         self.extra_deps = []
         self.extra_deps.extend(description.self_file_parts)
 
-    def __call__(self, force, verbose):
+    def execute(self, output, ctx):
         build_result = [BuildArtifact(BUILD_RET_TYPE_LIB, self.outlib_path, BUILD_RET_ATTR_DEFAULT)]
         target_is_ready = False
-        if not force:
-            target_is_ready, _ = is_target_up_to_date(self.outlib_path, self.primary_deps, self.extra_deps, verbose)
+        if not ctx.force:
+            target_is_ready, _ = is_target_up_to_date(self.outlib_path, self.primary_deps, self.extra_deps, ctx.verbose)
         if target_is_ready:
-            if verbose:
-                print("BUILDSYS: up-to-date: '{}', lib: {}".format(self.module_name, self.outlib_path))
-            return (False, build_result)
+            if ctx.verbose:
+                output.report_message("BUILDSYS: up-to-date: '{}', lib: {}".format(self.module_name, self.outlib_path))
+            return ToolsetActionResult(rebuilt=False, artifacts=build_result)
 
-        print("BUILDSYS: Create LIB module '{}' ...".format(self.module_name))
+        output.report_message("BUILDSYS: create LIB module '{}' ...".format(self.module_name))
 
         if self.tools.is_clang:
             with open(self.rsp_file, mode='wt') as rsp_fh:
@@ -235,16 +264,11 @@ class StaticLibLinkActionGCC:
             argv += self.obj_list
             argv = argv_to_rsp(argv, self.rsp_file)
 
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-        p = subprocess.Popen(argv)
-        p.communicate()
-        if p.returncode != 0:
-            raise BuildSystemException(self.outlib_path, exit_code=p.returncode)
-        return (True, build_result)
+        ctx.subprocess_communicate(output, argv, issuer=self.outlib_path)
+        return ToolsetActionResult(rebuilt=True, artifacts=build_result)
 
 
-class LinkActionGCC:
+class LinkActionGCC(ToolsetActionBase):
     def __init__(self, tools, sysinfo, loader, description, exe_directory, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config):
         self.tools = tools
         self.sharedlib_directory = sharedlib_directory
@@ -256,7 +280,6 @@ class LinkActionGCC:
         self.primary_deps = [ self.link_stamp_file ]
         self.extra_deps = []
         self.extra_deps.extend(description.self_file_parts)
-        self.win_console = description.win_console if self.tools.is_mingw else None
         self.win_stack_size = description.win_stack_size
         self.use_wmain = description.wmain
         self.zip_section = None
@@ -273,17 +296,21 @@ class LinkActionGCC:
             self.zip_section = zip_section_file
             self.primary_deps.append(zip_section_file)
 
+        self.module_name = description.module_name
+        self.module_name_private = description.module_name
+
         if self.is_dll:
             if self.tools.is_mingw:
-                self.bin_basename = ''.join([description.module_name, '.dll'])
+                self.bin_basename = description.module_name +'.dll'
             else:
-                self.bin_basename = ''.join(['lib', description.module_name, '.so'])
+                self.bin_basename = 'lib' + description.module_name + '.so'
         else:
             exe_name = description.module_name
             if description.exe_name:
                 exe_name = description.exe_name
+                self.module_name_private = description.exe_name
             if self.tools.is_mingw:
-                self.bin_basename = ''.join([exe_name, '.exe'])
+                self.bin_basename = exe_name + '.exe'
             else:
                 self.bin_basename = exe_name
 
@@ -300,43 +327,79 @@ class LinkActionGCC:
             if self.export_list or (self.export_def_file and not self.tools.is_mingw):
                 self.export_map_file = os.path.join(self.link_private_dir, 'symbols.map')
 
-        self.module_name = description.module_name
-        self.rsp_file = os.path.join(self.link_private_dir, '{}.rsplnk'.format(self.module_name))
+        if self.tools.is_mingw:
+            self.res_file = None
+            self.include_dirs = None
+            self.winrc_file = verify_winrc_file(description)
+            if self.winrc_file is not None:
+                self.include_dirs = eval_include_dirs_in_description(description, sysinfo[TAG_CFG_DIR_PROJECT_ROOT], None)
+                self.extra_deps.append(self.winrc_file)
+                self.res_file = os.path.join(self.link_private_dir, self.module_name_private + '.res.o')
+                self.winrc_definitions = description.winrc_definitions
+            if description.with_default_manifest:
+                self.manifest_res_file = os.path.join(self.link_private_dir, self.module_name_private + '.manifest.res.o')
+            else:
+                self.manifest_res_file = None
+
+        self.rsp_file = os.path.join(self.link_private_dir, self.module_name_private + '.rsplnk')
         self.obj_list = []
         self.arch_flags = []
-        self.arch_flags += build_model.get_arch_link_flags()
+        self.arch_flags += build_model.get_arch_link_flags(description)
         self.build_config = build_config
         for obj_name in obj_names:
-            obj_path = os.path.join(obj_directory, ''.join([obj_name, sysinfo[TAG_CFG_OBJ_SUFFIX]]))
+            obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
             self.obj_list.append(obj_path)
             self.primary_deps.append(obj_path)
         self.link_libstatic_names = []
         self.link_libshared_names = []
-        eval_libnames_in_description(loader, description, self.link_libstatic_names, self.link_libshared_names)
+        eval_libnames_in_description(loader, description, build_model, self.link_libstatic_names, self.link_libshared_names)
         self.prebuilt_lib_names = eval_prebuilt_lib_list_in_description(description, build_model)
 
-    def __call__(self, force, verbose):
+    def execute(self, output, ctx):
         mod_type_id = BUILD_RET_TYPE_DLL if self.is_dll else BUILD_RET_TYPE_EXE
         mod_attr = BUILD_RET_ATTR_DEFAULT if self.is_dll or self.tools.is_mingw else BUILD_RET_ATTR_FLAG_EXECUTABLE
         build_result = [BuildArtifact(mod_type_id, self.bin_path_public, mod_attr)]
         target_is_ready = False
-        if not force:
-            target_is_ready, _ = is_target_up_to_date(self.bin_path_public, self.primary_deps, self.extra_deps, verbose)
+        if not ctx.force:
+            target_is_ready, _ = is_target_up_to_date(self.bin_path_public, self.primary_deps, self.extra_deps, ctx.verbose)
         mod_type = 'DLL' if self.is_dll else 'EXE'
         if target_is_ready:
-            print("BUILDSYS: up-to-date: '{}', {}: {}".format(self.module_name, mod_type, self.bin_path_public))
-            return (False, build_result)
+            output.report_message("BUILDSYS: up-to-date: '{}', {}: {}".format(self.module_name, mod_type, self.bin_path_public))
+            return ToolsetActionResult(rebuilt=True, artifacts=build_result)
 
-        print("BUILDSYS: Link {} module '{}' ...".format(mod_type, self.module_name))
+        output.report_message("BUILDSYS: link {} module '{}' ...".format(mod_type, self.module_name))
         for built_item_info in build_result:
             if os.path.exists(built_item_info.path):
-                if verbose:
-                    print("BUILDSYS: remove file: {}".format(built_item_info.path))
+                if ctx.verbose:
+                    output.report_message("BUILDSYS: remove file: {}".format(built_item_info.path))
                 os.remove(built_item_info.path)
         cleanup_dir(self.link_private_dir)
         link_stamp_file_tmp = self.link_stamp_file + '.tmp'
         with open(link_stamp_file_tmp, mode='wb'):
             pass
+
+        if self.tools.is_mingw:
+            if self.winrc_file is not None:
+                argv = [self.tools.windres, self.winrc_file, self.res_file]
+                for incd in self.include_dirs:
+                    argv += [ '-I{}'.format(incd) ]
+                for defrc in self.winrc_definitions:
+                    argv += [ '-D{}'.format(defrc) ]
+                ctx.subprocess_communicate(output, argv, issuer=self.winrc_file, title=os.path.basename(self.winrc_file))
+
+            if self.manifest_res_file is not None:
+                manifest_builtin = os.path.join(self.link_private_dir, self.module_name_private + '.manifest')
+                manifest_rc = os.path.join(self.link_private_dir, self.module_name_private + '.manifest.rc')
+                with open(manifest_builtin, mode='wt') as fh_manifest:
+                    fh_manifest.writelines([WINRC_MANIFEST])
+                manifest_id = '2' if self.is_dll else '1'
+                with open(manifest_rc, mode='wt') as fh_manifest_rc:
+                    fh_manifest_rc.writelines([
+                        '#include <winuser.h>\n',
+                        '{} RT_MANIFEST {}\n'.format(manifest_id, self.module_name_private + '.manifest')
+                    ])
+                argv = [self.tools.windres, manifest_rc, self.manifest_res_file]
+                ctx.subprocess_communicate(output, argv, issuer=manifest_rc, title=os.path.basename(manifest_rc))
 
         argv = [ self.tools.gpp ]
         argv += self.arch_flags
@@ -377,10 +440,6 @@ class LinkActionGCC:
 
         else:
             if self.tools.is_mingw:
-                if self.win_console:
-                    argv += ['-Wl,-subsystem,console']
-                else:
-                    argv += ['-Wl,-subsystem,windows']
                 if self.use_wmain:
                     argv += ['-municode']
                 if self.win_stack_size:
@@ -401,7 +460,16 @@ class LinkActionGCC:
             if self.export_def_file and not self.export_map_file:
                 argv += [ self.export_def_file ]
 
+        if self.tools.is_mingw:
+            if self.res_file is not None:
+                argv += [ self.res_file ]
+            if self.manifest_res_file is not None:
+                argv += [ self.manifest_res_file ]
+
         argv += self.obj_list
+
+        if not self.tools.is_clang:
+            argv += ['-static-libgcc']
 
         wrap_libs_in_group = False
         if self.link_libstatic_names or self.link_libshared_names:
@@ -435,29 +503,19 @@ class LinkActionGCC:
                 argv += [ '-framework', framework_name ]
 
         argv = argv_to_rsp(argv, self.rsp_file)
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-        p = subprocess.Popen(argv)
-        p.communicate()
-        if p.returncode != 0:
-            raise BuildSystemException(self.bin_path_private, exit_code=p.returncode)
+        ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private)
 
         if self.macosx_install_name_options:
             argv = ['install_name_tool']
             argv += self.macosx_install_name_options
             argv += [ self.bin_path_private ]
-            if verbose:
-                print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
-            p = subprocess.Popen(argv)
-            p.communicate()
-            if p.returncode != 0:
-                raise BuildSystemException(self.bin_path_private, exit_code=p.returncode)
+            ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private)
 
         if self.zip_section is not None:
             if not os.path.isfile(self.zip_section):
                 raise BuildSystemException("File '{}' for zip-section not found".format(self.zip_section))
-            if verbose:
-                print("BUILDSYS: EXEC: {} << {}".format(self.bin_path_private, self.zip_section))
+            if ctx.verbose:
+                output.report_message("BUILDSYS: EXEC: {} << {}".format(self.bin_path_private, self.zip_section))
             with open(self.bin_path_private, 'ab') as fhbin:
                 with open(self.zip_section, 'rb') as fhzip:
                     shutil.copyfileobj(fhzip, fhbin)
@@ -467,20 +525,23 @@ class LinkActionGCC:
         os.utime(self.link_stamp_file, None)
         os.utime(self.bin_path_public, None)
 
-        return (True, build_result)
+        return ToolsetActionResult(rebuilt=True, artifacts=build_result)
 
 
 class GccModel(ToolsetModel):
-    def __init__(self, model_name, is_native, target_os, target_os_alias, arch_name, arch_flags, arch_link_flags):
+    def __init__(self, model_name, toolset_version, is_native, target_os, target_os_alias, arch_name, arch_flags, arch_link_flags, os_version=None, crosstool=False):
         ToolsetModel.__init__(self)
 
         self._model_name = model_name
+        self._toolset_version = toolset_version
         self._is_native = is_native
         self._target_os = target_os
         self._target_os_alias = target_os_alias
         self._arch_name = arch_name
         self._arch_compile_flags = arch_flags
         self._arch_link_flags = arch_link_flags
+        self._os_version = os_version
+        self._crosstool = crosstool
 
     @property
     def model_name(self):
@@ -498,14 +559,29 @@ class GccModel(ToolsetModel):
     def architecture_abi_name(self):
         return self._arch_name
 
+    @property
+    def toolset_version(self):
+        return self._toolset_version
+
     def is_native(self):
         return self._is_native
+
+    def is_crosstool(self):
+        return self._crosstool
 
     def get_arch_compile_flags(self):
         return self._arch_compile_flags
 
-    def get_arch_link_flags(self):
-        return self._arch_link_flags
+    def get_arch_link_flags(self, description):
+        if self._target_os == TAG_PLATFORM_WINDOWS:
+            flags = self._arch_link_flags[:]
+            if description.win_console:
+                flags.append('-Wl,-subsystem:console:{}'.format(self._os_version))
+            else:
+                flags.append('-Wl,-subsystem:windows:{}'.format(self._os_version))
+            return flags
+        else:
+            return self._arch_link_flags
 
 
 class ToolsetGCC(ToolsetBase):
@@ -519,6 +595,7 @@ class ToolsetGCC(ToolsetBase):
         self._nasm_checked = False
 
         models = []
+        toolset_version = tools.eval_version_info()
 
         if self._tools.is_mingw:
             self._platform_name = TAG_PLATFORM_WINDOWS
@@ -526,6 +603,7 @@ class ToolsetGCC(ToolsetBase):
             if TAG_ARCH_X86 in self._tools.arch_list:
                 winapi_level_x86 = self._tools.api_levels[TAG_ARCH_X86]
                 ntddi_level_x86 = IMPLIED_NTDDI_VALUES[winapi_level_x86]
+                os_version_x86 = IMPLIED_WINDOWS_SUBSYSTEM_VALUES[winapi_level_x86]
 
                 mingw_x86_compile_flags = ['-m32',
                     '-D_WIN32_WINNT={}'.format(winapi_level_x86),
@@ -535,15 +613,16 @@ class ToolsetGCC(ToolsetBase):
                 mingw_x86_link_flags = ['-m32']
 
                 model_win32 = GccModel(
-                    model_name=GCC_MODEL_MINGW32, is_native=is_windows_32bit(),
+                    model_name=GCC_MODEL_MINGW32, toolset_version=toolset_version, is_native=is_windows_32bit(),
                     target_os=TAG_PLATFORM_WINDOWS, target_os_alias=None, arch_name=TAG_ARCH_X86,
-                    arch_flags=mingw_x86_compile_flags, arch_link_flags=mingw_x86_link_flags)
+                    arch_flags=mingw_x86_compile_flags, arch_link_flags=mingw_x86_link_flags, os_version=os_version_x86)
 
                 models.append(model_win32)
 
             if TAG_ARCH_X86_64 in self._tools.arch_list:
                 winapi_level_x86_64 = self._tools.api_levels[TAG_ARCH_X86_64]
                 ntddi_level_x86_64 = IMPLIED_NTDDI_VALUES[winapi_level_x86_64]
+                os_version_x86_64 = IMPLIED_WINDOWS_SUBSYSTEM_VALUES[winapi_level_x86_64]
 
                 mingw_x86_64_compile_flags = ['-m64',
                     '-D_WIN32_WINNT={}'.format(winapi_level_x86_64),
@@ -553,9 +632,9 @@ class ToolsetGCC(ToolsetBase):
                 mingw_x86_64_link_flags = ['-m64']
 
                 model_win64 = GccModel(
-                    model_name=GCC_MODEL_MINGW64, is_native=is_windows_64bit(),
+                    model_name=GCC_MODEL_MINGW64, toolset_version=toolset_version, is_native=is_windows_64bit(),
                     target_os=TAG_PLATFORM_WINDOWS, target_os_alias=None, arch_name=TAG_ARCH_X86_64,
-                    arch_flags=mingw_x86_64_compile_flags, arch_link_flags=mingw_x86_64_link_flags)
+                    arch_flags=mingw_x86_64_compile_flags, arch_link_flags=mingw_x86_64_link_flags, os_version=os_version_x86_64)
 
                 models.append(model_win64)
 
@@ -567,9 +646,9 @@ class ToolsetGCC(ToolsetBase):
                 x_is_native = CROSSTOOL_NATIVE_STATUS[x_arch]
 
                 x_model = GccModel(
-                    model_name=x_model_name, is_native=x_is_native,
+                    model_name=x_model_name, toolset_version=toolset_version, is_native=x_is_native,
                     target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=x_arch,
-                    arch_flags=[], arch_link_flags=[])
+                    arch_flags=[], arch_link_flags=[], crosstool=True)
 
                 models.append(x_model)
 
@@ -578,12 +657,12 @@ class ToolsetGCC(ToolsetBase):
                 self._platform_name = TAG_PLATFORM_LINUX
 
                 model_linux_x86 = GccModel(
-                    model_name=GCC_MODEL_LINUX_X86, is_native=False,
+                    model_name=GCC_MODEL_LINUX_X86, toolset_version=toolset_version, is_native=False,
                     target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86,
                     arch_flags=['-m32'], arch_link_flags=['-m32'])
 
                 model_linux_x86_64 = GccModel(
-                    model_name=GCC_MODEL_LINUX_X86_64, is_native=True,
+                    model_name=GCC_MODEL_LINUX_X86_64, toolset_version=toolset_version, is_native=True,
                     target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86_64,
                     arch_flags=[], arch_link_flags=[])
 
@@ -593,7 +672,7 @@ class ToolsetGCC(ToolsetBase):
                 self._platform_name = TAG_PLATFORM_LINUX
 
                 model_linux_x86 = GccModel(
-                    model_name=GCC_MODEL_LINUX_X86, is_native=True,
+                    model_name=GCC_MODEL_LINUX_X86, toolset_version=toolset_version, is_native=True,
                     target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86,
                     arch_flags=[], arch_link_flags=[])
 
@@ -603,7 +682,7 @@ class ToolsetGCC(ToolsetBase):
                 self._platform_name = TAG_PLATFORM_LINUX
 
                 model_linux_arm = GccModel(
-                    model_name=GCC_MODEL_LINUX_ARM, is_native=True,
+                    model_name=GCC_MODEL_LINUX_ARM, toolset_version=toolset_version, is_native=True,
                     target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_ARM,
                     arch_flags=[], arch_link_flags=[])
 
@@ -613,7 +692,7 @@ class ToolsetGCC(ToolsetBase):
                 self._platform_name = TAG_PLATFORM_LINUX
 
                 model_linux_arm = GccModel(
-                    model_name=GCC_MODEL_LINUX_ARM64, is_native=True,
+                    model_name=GCC_MODEL_LINUX_ARM64, toolset_version=toolset_version, is_native=True,
                     target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_ARM64,
                     arch_flags=[], arch_link_flags=[])
 
@@ -624,7 +703,7 @@ class ToolsetGCC(ToolsetBase):
                     self._platform_name = TAG_PLATFORM_MACOSX
 
                     model_macosx_x86_64 = GccModel(
-                        model_name=CLANG_MODEL_MACOSX_X86_64, is_native=True,
+                        model_name=CLANG_MODEL_MACOSX_X86_64, toolset_version=toolset_version, is_native=True,
                         target_os=TAG_PLATFORM_MACOSX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86_64,
                         arch_flags=[], arch_link_flags=[])
 
@@ -635,7 +714,7 @@ class ToolsetGCC(ToolsetBase):
                 if platform.startswith('linux'):
                     platform = 'linux'
                 machine = os.uname()[4]
-                raise BuildSystemException("Unsupported platform: '{},{}'".format(platform,machine))
+                raise BuildSystemException("Unsupported platform: '{},{}'".format(platform, machine))
 
         self._models = {}
         for model in models:
@@ -667,7 +746,7 @@ class ToolsetGCC(ToolsetBase):
                 try:
                     subprocess.check_output([self._tools.nasm_executable, '-v'], stderr=subprocess.STDOUT)
                     self._nasm_checked = True
-                except Exception as _:
+                except Exception:
                     pass
             if not self._nasm_checked:
                 raise BuildSystemException("NASM executable '{}' is not ready, it is required to compile: '{}'".format(self._tools.nasm_executable, asm_source))
@@ -691,16 +770,21 @@ class ToolsInfoGCC:
         tool_gcc = 'clang' if is_clang else 'gcc'
         tool_gpp = 'clang' if is_clang else 'g++'
         tool_ar  = 'libtool' if is_clang else 'ar'
+        tool_windres = 'windres' if is_mingw else None
 
         if bin_prefix is not None:
             tool_gcc = bin_prefix + tool_gcc
             tool_gpp = bin_prefix + tool_gpp
-            tool_ar = bin_prefix + tool_ar
+            tool_ar  = bin_prefix + tool_ar
+            if tool_windres is not None:
+                tool_windres = bin_prefix + tool_windres
 
         if dir_prefix is not None:
             tool_gcc = os.path.join(dir_prefix, tool_gcc)
             tool_gpp = os.path.join(dir_prefix, tool_gpp)
-            tool_ar = os.path.join(dir_prefix, tool_ar)
+            tool_ar  = os.path.join(dir_prefix, tool_ar)
+            if tool_windres is not None:
+                tool_windres = os.path.join(dir_prefix, tool_windres)
 
         self.is_mingw = is_mingw
         self.is_clang = is_clang
@@ -711,6 +795,7 @@ class ToolsInfoGCC:
         self.gcc = tool_gcc
         self.gpp = tool_gpp
         self.ar  = tool_ar
+        self.windres = tool_windres
         self.nasm_executable = nasm if nasm else 'nasm'
         self.nasm_enabled = False
 
@@ -725,6 +810,26 @@ class ToolsInfoGCC:
         else:
             if is_linux_x86_64() or is_linux_x86() or is_macosx_x86_64():
                 self.nasm_enabled = True
+
+    def eval_version_info(self):
+        argv = [self.gpp, '--version']
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        version_text, _ = p.communicate()
+        version_bits = version_text.split('\n')
+        if version_bits and version_bits[0] and version_bits[0].rstrip('\r\n').strip():
+            version_text = version_bits[0].rstrip('\r\n').strip()
+        if p.returncode != 0:
+            errmsg = ' '.join(argv) + '\n' + version_text
+            raise BuildSystemException(errmsg, exit_code=p.returncode)
+        version = None
+        if self.is_clang:
+            version = parse_clang_version_string(version_text)
+        else:
+            version = parse_gcc_version_string(version_text)
+        if version is None:
+            errmsg = ' '.join(argv) + '\n' + version_text + "\n   Failed to parse version string given above."
+            raise BuildSystemException(errmsg)
+        return version
 
 
 def init_mingw_tools(sysinfo, mingw, nasm):
@@ -814,13 +919,18 @@ def _describe_toolset_imp(native_id, config_proto, pragma_line, sys_platform, sy
     config_parts = []
     conflicts = None
     models_per_arch = {}
+
     if 'mingw' in kwargs:
         mingw_parts = []
         mingw = kwargs['mingw']
+        required = mingw.get('required', 0)
         mingw_package = mingw.get('package')
         mingw_prefix = mingw.get('prefix')
         if mingw_package:
             if not os.path.isdir(os.path.expanduser(mingw_package)):
+                if not required:
+                    print("BUILDSYS: makefile: '{}', line: {}\n  MinGW 'package' directory not found: '{}'".format(config_proto, pragma_line, mingw_package))
+                    return None, None, None, None
                 raise BuildSystemException("Can't process makefile: '{}', line: {}, MinGW 'package' directory not found: '{}'.".format(config_proto, pragma_line, mingw_package))
             mingw_parts += ["'package_path':'{}'".format(escape_string(mingw_package))]
         if mingw_prefix:
@@ -868,11 +978,15 @@ def _describe_toolset_imp(native_id, config_proto, pragma_line, sys_platform, sy
     elif 'xtools' in kwargs:
         xtools_parts = []
         xtools = kwargs['xtools']
+        required = xtools.get('required', 0)
         xtools_package = xtools.get('package')
         xtools_prefix = xtools.get('prefix')
         if not xtools_package:
             raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'package' directory is not given.".format(config_proto, pragma_line))
         if not os.path.isdir(os.path.expanduser(xtools_package)):
+            if not required:
+                print("BUILDSYS: makefile: '{}', line: {}\n  crosstools 'package' directory not found: '{}'".format(config_proto, pragma_line, xtools_package))
+                return None, None, None, None
             raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'package' directory not found: '{}'.".format(config_proto, pragma_line, xtools_package))
         xtools_parts += ["'package_path':'{}'".format(escape_string(xtools_package))]
         if xtools_prefix:

@@ -1,10 +1,24 @@
+#pragma os:linux pass   cmdline='--model gcc-xt-linux-x86_64 --public --public-format zip --public-layout flat'
+#pragma os:macosx pass  cmdline='--model clang-macosx-x86_64 --public --public-format zip --public-layout flat'
+#pragma os:windows pass cmdline='--model mingw-win64         --public --public-format zip --public-layout flat'
+
 #import "@/cpython2/build/pyfreeze"
+
 import os.path
+
+if BUILDSYS_TARGET_PLATFORM == 'macosx':
+    public_name = 'minibuild-macosx'
+elif BUILDSYS_TARGET_PLATFORM == 'windows':
+    if BUILDSYS_TOOLSET_NAME == 'gcc':
+        public_name = 'minibuild-mingw-{}'.format(BUILDSYS_TARGET_ARCH)
+    elif BUILDSYS_TOOLSET_NAME == 'msvs':
+        public_name = 'minibuild-msvs{}-{}'.format(BUILDSYS_TOOLSET_VERSION, BUILDSYS_TARGET_ARCH)
+if not public_name:
+    public_name = 'minibuild-{}-{}'.format(BUILDSYS_TARGET_PLATFORM, BUILDSYS_TARGET_ARCH)
 
 module_type = 'executable'
 module_name = 'minibuild'
 build_list = ['main.c', 'minibuild_frozen.c', 'minibuild_frozen_impl.c']
-win_console = 1
 win_stack_size = 2000000
 
 spec_file = 'freeze.spec'
@@ -21,7 +35,13 @@ include_dir_list += [
   '${@project_root}/cpython2/vendor/Include',
 ]
 
-lib_list = [
+
+if os.path.isdir(os.path.join(BUILDSYS_PROJECT_ROOT_DIRNAME, 'pyffi')):
+    lib_list += ['${@project_root}/pyffi']
+elif os.path.isdir(os.path.join(BUILDSYS_PROJECT_ROOT_DIRNAME, 'libffi')):
+    lib_list += ['${@project_root}/libffi']
+
+lib_list += [
   '${@project_root}/cpython2/build/core/static',
   '${@project_root}/cpython2/build/stdlib/static',
   '${@project_root}/cpython2/build/modules/ctypes/static',
@@ -37,7 +57,6 @@ lib_list = [
   '${@project_root}/cpython2/build/modules/bz2/static',
   '${@project_root}/cpython2/build/modules/crypt/static',
   '${@project_root}/zlib',
-  '${@project_root}/pyffi',
   '${@project_root}/openssl/build/crypto_static',
   '${@project_root}/openssl/build/ssl_static',
   '${@project_root}/openssl_posix_crypt/contrib/static',

@@ -17,6 +17,14 @@ IMPLIED_NTDDI_VALUES = {
     '0x0501': '0x05010200',
 }
 
+IMPLIED_WINDOWS_SUBSYSTEM_VALUES = {
+    '0x0602': '6.02',
+    '0x0601': '6.01',
+    '0x0600': '6.00',
+    '0x0502': '5.02',
+    '0x0501': '5.01',
+}
+
 WINDOWS_API_DEFAULT_LEVEL = {
     TAG_ARCH_X86: '0x0501',
     TAG_ARCH_X86_64: '0x0502',

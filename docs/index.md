@@ -16,32 +16,38 @@ Some _grammar tokens_ are **_ISA_ (instruction set architecture) extendable**. S
 
 Some other _grammar tokens_ are **platform extendable**. So if for example grammar token **var** marked as **platform extendable**, than the following grammar tokens are supported as well: **var_linux, var_macosx, var_posix, var_windows**
 
-* **module_type**  
+* **module_type**
   _string_, possible values: `executable`, `lib-static`, `lib-shared`,  `composite`, `zip-file`, `download`.  
   
-* **module_name**  
+* **module_name**
   _string_  
   The name of module being built.  
   
-* **exe_name**  
-  _string_, effective when _module_type='executable'_    
+* **exe_name**
+  _string_, effective when _module_type='executable'_  
   The file name of executable binary being built. When this option is not given, then value of the option `module_name` is used instead.  
   
-*  **public_name**  
+*  **public_name**
   The name of zip-archive for publishing, when given it is used instead of `module_name`.  
   
-* **build_list**  
+* **build_list**
   _list of strings_  
   The list of file names (not paths) of which describing module consists of.  
   ISA extensions: **build_list_linux, build_list_linux_arm, build_list_linux_arm64, build_list_linux_x86, build_list_linux_x86_64, build_list_macosx, build_list_macosx_arm, build_list_macosx_arm64, build_list_macosx_x86, build_list_macosx_x86_64, build_list_posix, build_list_posix_arm, build_list_posix_arm64, build_list_posix_x86, build_list_posix_x86_64, build_list_windows, build_list_windows_arm, build_list_windows_arm64, build_list_windows_x86, build_list_windows_x86_64**
   
-* **symbol_visibility_default**  
+* **symbol_visibility_default**
   _boolean (integer)_, GCC/MinGW specific  
   When set to _True_, source files are compiled _without_ GCC command line argument `‑fvisibility=hidden`, otherwise the argument `‑fvisibility=hidden` is always being used.  
   
-* **win_console**  
+* **win_console**
   _boolean (integer)_, Windows specific, effective when _module_type='executable'_  
   When set to _True_, target executable is compiled for subsystem `console`.  
+  When this grammar token is not given, its default value: `win_console = 1`
+  
+* **with_default_manifest**
+  _boolean (integer)_, Windows specific, effective when _module_type_ is _'executable'_ or _'lib-shared'_  
+  When set to _True_, target binary is built with manifest file predefined in _MiniBuild_ build system.  
+  When this grammar token is not given, its default value: `with_default_manifest = 1`
   
 * **win_stack_size**
   _integer_, Windows specific, effective when _module_type='executable'_  
@@ -50,6 +56,14 @@ Some other _grammar tokens_ are **platform extendable**. So if for example gramm
 * **wmain**
   _boolean (integer)_, Windows specific, effective when _module_type='executable'_  
   This option has to be set to _True_, when executable entry point is `wmain`.  
+  
+* **winrc_file**
+  _string_, Windows specific, effective when _module_type_ is _'executable'_ or _'lib-shared'_  
+  Path to a resource-definition script (.rc file) that describes the resources used by binary being built.  
+  
+* **winrc_definitions**
+  _list of strings_, Windows specific, effective when _module_type_ is _'executable'_ or _'lib-shared'_  
+  The list of extra definitions to be used during compilation of a resource-definition script (.rc file) specified by option `winrc_file`.  
   
 * **nasm**
   _boolean (integer)_, _i686_, _x86_64_ specific  

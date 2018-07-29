@@ -103,23 +103,19 @@ def eval_include_dirs_in_description(description, project_root, source_type):
     return include_dirs
 
 
-def eval_explicit_depends_in_description(loader, description, xpl_depends):
+def eval_explicit_depends_in_description(loader, description, model, xpl_depends):
     for depref in description.explicit_depends:
         depdir = normalize_path_optional(depref, description.self_dirname)
-        if not os.path.isdir(depdir):
-            raise BuildSystemException("Directory '{}' not found, required as explicit dependence in '{}'".format(depdir, description.self_file_parts[0]))
-        depdesc = loader.load_build_description(depdir)
+        depdesc = loader.load_build_description(depdir, model, required_by=description.self_file_parts[0])
         xpl_depends.append(depdesc)
 
 
-def eval_libs_in_description(loader, description, static_libs, shared_libs):
+def eval_libs_in_description(loader, description, model, static_libs, shared_libs):
     if not description.lib_list:
         return
     for libref in description.lib_list:
         libdir = normalize_path_optional(libref, description.self_dirname)
-        if not os.path.isdir(libdir):
-            raise BuildSystemException("Lib directory '{}' not found, required in '{}'".format(libdir, description.self_file_parts[0]))
-        libdesc = loader.load_build_description(libdir)
+        libdesc = loader.load_build_description(libdir, model, required_by=description.self_file_parts[0])
         if libdesc.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_LIB_STATIC:
             static_libs.append(libdesc)
         elif libdesc.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_LIB_SHARED:
@@ -128,10 +124,10 @@ def eval_libs_in_description(loader, description, static_libs, shared_libs):
             raise BuildSystemException("Not a description of a shared/static library: '{}'".format(description.self_file_parts[0]))
 
 
-def eval_libnames_in_description(loader, description, libstatic_names, libshared_names):
+def eval_libnames_in_description(loader, description, model, libstatic_names, libshared_names):
     static_libs = []
     shared_libs = []
-    eval_libs_in_description(loader, description, static_libs, shared_libs)
+    eval_libs_in_description(loader, description, model, static_libs, shared_libs)
     for desc in static_libs:
         libstatic_names.append(desc.module_name)
     for desc in shared_libs:
@@ -174,6 +170,15 @@ def verify_exports_def_file(description):
     if not os.path.isfile(exports_fname):
         raise BuildSystemException("Exports definition file '{}' not found, required in '{}'".format(exports_fname, description.self_file_parts[0]))
     return exports_fname
+
+
+def verify_winrc_file(description):
+    if description.winrc_file is None:
+        return None
+    winrc_fname = normalize_path_optional(description.winrc_file, description.self_dirname)
+    if not os.path.isfile(winrc_fname):
+        raise BuildSystemException("RC file '{}' not found, required in '{}'".format(winrc_fname, description.self_file_parts[0]))
+    return winrc_fname
 
 
 def parse_gnu_makefile_depends(common_prefix, src_path, dep_path, obj_path):

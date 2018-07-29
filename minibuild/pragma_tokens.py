@@ -1,4 +1,5 @@
 import shlex
+import sys
 import re
 
 from .constants import *

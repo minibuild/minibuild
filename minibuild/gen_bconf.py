@@ -126,6 +126,7 @@ def _generate_build_config_imp(config_proto, dest_config, sys_platform, sys_arch
 
     toolset_ids = []
     conf_parts_tail = []
+    skipped_toolset_count = 0
     for conf in toolset_init_requests:
         mod_toolset = imported_toolset_modules[conf.toolset_name]
         pragma_options = {}
@@ -136,6 +137,9 @@ def _generate_build_config_imp(config_proto, dest_config, sys_platform, sys_arch
         if nasm_executable:
             pragma_options['nasm_executable'] = nasm_executable
         toolset_id, description_lines, conflicts, models_per_arch = mod_toolset.describe_toolset(config_proto, conf.pragma_line, sys_platform, sys_arch, **pragma_options)
+        if toolset_id is None:
+            skipped_toolset_count += 1
+            continue
         if not isinstance(conflicts, list):
             conflicts = []
         conflicts.append(toolset_id)
@@ -150,6 +154,9 @@ def _generate_build_config_imp(config_proto, dest_config, sys_platform, sys_arch
         toolset_ids += [(toolset_id, conf)]
         conf_parts_tail.append("")
         conf_parts_tail.extend(description_lines)
+
+    if not toolset_ids:
+        raise BuildSystemException("Can't find any build toolset on this machine, tried toolsets count: {}".format(skipped_toolset_count))
 
     all_toolset = []
     for processed_id, _ in toolset_ids:

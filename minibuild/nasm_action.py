@@ -1,11 +1,10 @@
-from __future__ import print_function
 import os.path
-import subprocess
 
 from .constants import *
 from .depends_check import *
 from .error_utils import BuildSystemException
 from .string_utils import escape_string
+from .toolset_base import ToolsetActionBase, ToolsetActionResult
 
 
 NASM_OUTPUT_FORMATS = {
@@ -13,7 +12,7 @@ NASM_OUTPUT_FORMATS = {
     TAG_PLATFORM_LINUX: {TAG_ARCH_X86: 'elf32', TAG_ARCH_X86_64: 'elf64'},
 }
 
-class NasmSourceBuildAction:
+class NasmSourceBuildAction(ToolsetActionBase):
     def __init__(self, nasm_executable, sysinfo, description, asm_file_path, obj_directory, obj_name, build_model, build_config):
         self.nasm = nasm_executable
         self.asm_path = asm_file_path
@@ -30,18 +29,18 @@ class NasmSourceBuildAction:
         self.platform_name = build_model.platform_name
         self.build_config = build_config
 
-    def __call__(self, force, verbose):
+    def execute(self, output, ctx):
         target_is_ready = False
-        if not force:
+        if not ctx.force:
             target_is_ready = is_target_with_deps_up_to_date(
-                self.project_root, self.asm_path, self.obj_path, self.dep_path, self.extra_deps, verbose)
+                self.project_root, self.asm_path, self.obj_path, self.dep_path, self.extra_deps, ctx.verbose)
         if target_is_ready:
-            if verbose:
-                print("BUILDSYS: up-to-date: {}".format(self.asm_path))
-            return False
+            if ctx.verbose:
+                output.report_message("BUILDSYS: up-to-date: {}".format(self.asm_path))
+            return ToolsetActionResult(rebuilt=False, artifacts=None)
 
-        if verbose:
-            print("BUILDSYS: ASM: {}".format(self.asm_path))
+        if ctx.verbose:
+            output.report_message("BUILDSYS: ASM: {}".format(self.asm_path))
 
         out_format = NASM_OUTPUT_FORMATS.get(self.platform_name, {}).get(self.arch)
         if not out_format:
@@ -62,19 +61,12 @@ class NasmSourceBuildAction:
 
         argv += ['-o', self.obj_path, '-MD', self.deptmp_path, self.asm_path]
 
-        if verbose:
-            print("BUILDSYS: EXEC: {}".format(' '.join(argv)))
+        ctx.subprocess_communicate(output, argv, issuer=self.asm_path, title=os.path.basename(self.asm_path))
 
-        print(os.path.basename(self.asm_path))
-        p = subprocess.Popen(argv)
-        p.communicate()
-        if p.returncode != 0:
-            raise BuildSystemException(self.asm_path, exit_code=p.returncode)
         depends = parse_gnu_makefile_depends(self.common_prefix, self.asm_path, self.deptmp_path, self.obj_path)
         with open(self.dep_path, mode='wt') as dep_content:
             dep_content.writelines(['[\n'])
             for dep_item in depends:
                 dep_content.writelines(['    "', escape_string(dep_item), '",\n'])
             dep_content.writelines([']\n'])
-        os.remove(self.deptmp_path)
-        return True
+        return ToolsetActionResult(rebuilt=True, artifacts=None)

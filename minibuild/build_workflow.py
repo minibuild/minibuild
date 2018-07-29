@@ -10,13 +10,15 @@ import sys
 import tarfile
 import zipfile
 
+from .actions_pool import ActionsPool
 from .build_art import BuildArtifact
 from .constants import *
-from .depends_check import eval_explicit_depends_in_description, eval_libs_in_description, is_target_up_to_date, prerequisite_newer_then_target
-from .error_utils import BuildSystemException
-from .os_utils import cleanup_dir, mkdir_safe, normalize_path_optional
+from .depends_check import *
+from .error_utils import BuildSystemException, BuildSystemSysExit
+from .os_utils import cleanup_dir, mkdir_safe, normalize_path_optional, load_py_object
 from .spec_file import parse_spec_file
 from .string_utils import is_string_instance
+from .toolset_base import ToolsetActionContext
 
 
 _BUILD_TYPE_MAPPING = {
@@ -121,6 +123,29 @@ class BuildCache:
             return self._state[used_model_name].get(description.self_dirname)
         return None
 
+class ActiveExtState:
+    def __init__(self):
+        self._state = {}
+
+    def inc_ref(self, description, used_model_name):
+        if used_model_name not in self._state:
+            self._state[used_model_name] = {}
+        if description.self_dirname in self._state[used_model_name]:
+            self._state[used_model_name][description.self_dirname] += 1
+        else:
+            self._state[used_model_name][description.self_dirname] = 1
+        return self._state[used_model_name][description.self_dirname]
+
+    def dec_ref(self, description, used_model_name):
+        r = -1
+        if used_model_name in self._state and description.self_dirname in self._state[used_model_name]:
+            self._state[used_model_name][description.self_dirname] -= 1
+            r = self._state[used_model_name][description.self_dirname]
+        return r
+
+    def ref_count(self, description, used_model_name):
+        return self._state.get(used_model_name, {}).get(description.self_dirname, 0)
+
 
 def zip_module_rebuild_required(zip_obj_dir, zippath, catalog, description, verbose):
     post_build_stamp_file = None
@@ -145,57 +170,25 @@ def zip_module_rebuild_required(zip_obj_dir, zippath, catalog, description, verb
     return False
 
 
-def build_zip_module(sysinfo, grammar_substitutions, description, force, verbose):
-    if not description.spec_file:
-        raise BuildSystemException("Mandatory token '{}' is missed, required in '{}'.".format(TAG_GRAMMAR_KEY_SPEC_FILE, description.self_file_parts[0]))
-    if not description.zip_file:
-        raise BuildSystemException("Mandatory token '{}' is missed, required in '{}'.".format(TAG_GRAMMAR_KEY_ZIP_FILE, description.self_file_parts[0]))
-
-    zip_obj_dir = os.path.join(sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
-    mkdir_safe(zip_obj_dir)
-
-    spec_fname = normalize_path_optional(description.spec_file, description.self_dirname)
-    catalog = parse_spec_file(spec_fname, grammar_substitutions)
-
-    zippath = os.path.join(zip_obj_dir, description.zip_file)
-    if force:
-        need_rebuild = True
-    else:
-        need_rebuild = zip_module_rebuild_required(zip_obj_dir, zippath, catalog, description, verbose)
-    zipspec_catalog = []
-    if need_rebuild:
-        print("BUILDSYS: Zipping '{}' ...".format(description.module_name))
-        if os.path.exists(zippath):
-            os.remove(zippath)
-        with zipfile.ZipFile(zippath, "w", zipfile.ZIP_DEFLATED) as z:
-            for source, arcname in catalog:
-                z.write(source, arcname)
-                zipspec_catalog.append([source, arcname])
-    else:
-        print("BUILDSYS: up-to-date: '{}', ZIP: {}".format(description.module_name, zippath))
-
-    return (need_rebuild, [BuildArtifact(BUILD_RET_TYPE_ZIP, zippath, BUILD_RET_ATTR_DEFAULT)])
-
-
 def download_link(url, target_file):
-        context = None
-        if url.startswith('https:'):
-            if (sys.version_info.major, sys.version_info.minor, sys.version_info.micro) >= (2,7,9):
-                import ssl
-                context = ssl._create_unverified_context()
-        if sys.version_info.major < 3:
-            import urllib2
-            urlopen = urllib2.urlopen
-        else:
-            import urllib.request
-            urlopen = urllib.request.urlopen
-        if context is not None:
-            response = urlopen(url, context=context)
-        else:
-            response = urlopen(url)
-        payload = response.read()
-        with open(target_file, mode='wb') as file_object:
-            file_object.write(payload)
+    context = None
+    if url.startswith('https:'):
+        if (sys.version_info.major, sys.version_info.minor, sys.version_info.micro) >= (2,7,9):
+            import ssl
+            context = ssl._create_unverified_context()
+    if sys.version_info.major < 3:
+        import urllib2
+        urlopen = urllib2.urlopen
+    else:
+        import urllib.request
+        urlopen = urllib.request.urlopen
+    if context is not None:
+        response = urlopen(url, context=context)
+    else:
+        response = urlopen(url)
+    payload = response.read()
+    with open(target_file, mode='wb') as file_object:
+        file_object.write(payload)
 
 
 def download_files(sysinfo, description, force_download, verbose):
@@ -257,7 +250,7 @@ class ExtAction:
         self._argv = argv
 
     def __call__(self):
-        print("BUILDSYS: Run {} action '{}' for module '{}'".format(self._ext_type, self._ext_name, self._module_name))
+        print("BUILDSYS: run {} action '{}' for module '{}'".format(self._ext_type, self._ext_name, self._module_name))
         if self._verbose:
             print("BUILDSYS: EXEC: {}".format(self._argv))
         p = subprocess.Popen(self._argv)
@@ -274,7 +267,7 @@ class BuildExtensionEntry:
 
 
 class BuildWorkflow:
-    def __init__(self, sysinfo, toolset_models_mapping, native_model_remap, grammar_substitutions):
+    def __init__(self, sysinfo, toolset_models_mapping, native_model_remap, grammar_substitutions, verbose, trace, parallelism, faccess, faccess_prefixes):
         self._sysinfo = sysinfo
         self._toolset_models_mapping = toolset_models_mapping
         self._native_model_remap = native_model_remap
@@ -282,6 +275,12 @@ class BuildWorkflow:
         self._imported_extensions = {}
         self._grammar_substitutions = grammar_substitutions
         self._build_cache = BuildCache()
+        self._ext_protector = ActiveExtState()
+        self._verbose = verbose
+        self._trace = trace
+        self._faccess = faccess
+        self._faccess_prefixes = faccess_prefixes
+        self._actions_pool = ActionsPool(jobs_count=parallelism, verbose=verbose)
 
     def import_extension(self, loader, dname_import, required_by):
         dname_import_id = os.path.normcase(dname_import)
@@ -295,17 +294,23 @@ class BuildWorkflow:
         self._imported_extensions[ext_description.ext_name] = BuildExtensionEntry(dname_import, ext_description)
         return ext_description
 
-    def run(self, build_directory, used_model_name, build_config, public, public_format, public_layout, rebuild_level, verbose):
-        _, loader = self._toolset_models_mapping[used_model_name]
-        description = loader.load_build_description(build_directory)
-        build_result = self._perform_build(description, used_model_name, build_config, rebuild_level, verbose)
-        if public and description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_COMPOSITE:
-            self._publish_composite_artifacts(build_result, description, used_model_name, build_config, public_format, public_layout, rebuild_level, verbose)
+    def run(self, build_directory, used_model_name, build_config, public, public_format, public_layout, rebuild_level):
+        toolset, loader = self._toolset_models_mapping[used_model_name]
+        current_model = toolset.supported_models[used_model_name]
+        description = loader.load_build_description(build_directory, current_model)
+        try:
+            self._actions_pool.init()
+            build_result = self._perform_build(description, used_model_name, build_config, rebuild_level)
+        finally:
+            self._actions_pool.shutdown()
 
-    def _publish_composite_artifacts(self, build_result, description, used_model_name, build_config, public_format, public_layout, rebuild_level, verbose):
+        if public:
+            self._publish_module_artifacts(build_result, description, used_model_name, build_config, public_format, public_layout, rebuild_level)
+
+    def _publish_module_artifacts(self, build_result, description, used_model_name, build_config, public_format, public_layout, rebuild_level):
         being_built, artifacts = build_result[0], build_result[1]
-        composite_obj_dir_prefix = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, used_model_name, build_config) + os.sep
-        composite_obj_dir_prefix_length = len(composite_obj_dir_prefix)
+        obj_dir_prefix = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, used_model_name, build_config) + os.sep
+        obj_dir_prefix_length = len(obj_dir_prefix)
         if public_layout == TAG_PUBLIC_LAYAOUT_FLAT:
             public_dir = self._sysinfo[TAG_CFG_DIR_PUBLIC]
         else:
@@ -326,15 +331,18 @@ class BuildWorkflow:
         print("BUILDSYS: publishing: {}: {}".format(current_format, publication))
         catalog = []
         for art in artifacts:
-            if not art.path.startswith(composite_obj_dir_prefix):
-                raise BuildSystemException("Got out of tree artifact location: '{}', it is not in: '{}*'.".format(art.path, composite_obj_dir_prefix))
-            arcname = art.path[composite_obj_dir_prefix_length:].replace('\\', '/')
+            if description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_COMPOSITE:
+                if not art.path.startswith(obj_dir_prefix):
+                    raise BuildSystemException("Got out of tree artifact location: '{}', it is not in: '{}*'.".format(art.path, obj_dir_prefix))
+                arcname = art.path[obj_dir_prefix_length:].replace('\\', '/')
+            else:
+                arcname = os.path.basename(art.path)
             catalog.append((art, arcname))
         do_publish = rebuild_level > 0
         if not do_publish:
             do_publish = being_built
         if not do_publish:
-            up_to_date, _ = is_target_up_to_date(publication, None, artifacts, verbose)
+            up_to_date, _ = is_target_up_to_date(publication, None, artifacts, self._verbose)
             if not up_to_date:
                 do_publish = True
         if not do_publish:
@@ -366,7 +374,66 @@ class BuildWorkflow:
                     z.write(art.path, arcname)
         print("BUILDSYS: '{}' published as {}".format(description.module_name, publication))
 
-    def _perform_build(self, description, used_model_name, build_config, rebuild_level, verbose):
+    def _follow_faccess_for_file(self, source):
+        faccess_stamps = []
+        norm_src_path = os.path.normcase(source)
+        faccess_in_interest = False
+        for faccess_prefix in self._faccess_prefixes:
+            if norm_src_path.startswith(self._sysinfo[TAG_CFG_PROJECT_OUTPUT_COMMON_PREFIX]):
+                break
+            if norm_src_path.startswith(faccess_prefix):
+                faccess_in_interest = True
+                break
+        if not faccess_in_interest:
+            return
+        norm_src_relpath = source[len(self._sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX]):]
+        faccess_stamp_file = os.path.join(self._sysinfo[TAG_CFG_DIR_FACCESS], norm_src_relpath)
+        faccess_stamps += [ (norm_src_relpath.replace('\\', '/'), faccess_stamp_file) ]
+        for faccess_relpath, faccess_stamp_file in faccess_stamps:
+            if self._verbose:
+                print("BUILDSYS: FACCESS: {}".format(faccess_relpath))
+            mkdir_safe(os.path.dirname(faccess_stamp_file))
+            with open(faccess_stamp_file, 'wb'):
+                pass
+
+    def _follow_faccess_in_spec_file(self, catalog):
+        for source, _ in catalog:
+            self._follow_faccess_for_file(source)
+
+    def _build_zip_module(self, description, force):
+        if not description.spec_file:
+            raise BuildSystemException("Mandatory token '{}' is missed, required in '{}'.".format(TAG_GRAMMAR_KEY_SPEC_FILE, description.self_file_parts[0]))
+        if not description.zip_file:
+            raise BuildSystemException("Mandatory token '{}' is missed, required in '{}'.".format(TAG_GRAMMAR_KEY_ZIP_FILE, description.self_file_parts[0]))
+
+        zip_obj_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
+        mkdir_safe(zip_obj_dir)
+
+        spec_fname = normalize_path_optional(description.spec_file, description.self_dirname)
+        catalog = parse_spec_file(spec_fname, self._grammar_substitutions)
+
+        zippath = os.path.join(zip_obj_dir, description.zip_file)
+        if force:
+            need_rebuild = True
+        else:
+            need_rebuild = zip_module_rebuild_required(zip_obj_dir, zippath, catalog, description, self._verbose)
+        zipspec_catalog = []
+        if need_rebuild:
+            print("BUILDSYS: Zipping '{}' ...".format(description.module_name))
+            if os.path.exists(zippath):
+                os.remove(zippath)
+            with zipfile.ZipFile(zippath, "w", zipfile.ZIP_DEFLATED) as z:
+                for source, arcname in catalog:
+                    z.write(source, arcname)
+                    zipspec_catalog.append([source, arcname])
+            if self._faccess:
+                self._follow_faccess_in_spec_file(catalog)
+        else:
+            print("BUILDSYS: up-to-date: '{}', ZIP: {}".format(description.module_name, zippath))
+
+        return (need_rebuild, [BuildArtifact(BUILD_RET_TYPE_ZIP, zippath, BUILD_RET_ATTR_DEFAULT)])
+
+    def _perform_build(self, description, used_model_name, build_config, rebuild_level):
         toolset, loader = self._toolset_models_mapping[used_model_name]
         current_model = toolset.supported_models[used_model_name]
 
@@ -377,17 +444,17 @@ class BuildWorkflow:
                 print("BUILDSYS: up-to-date(cached): '{}', {}".format(description.module_name, description.module_type))
                 return (False, cached_prebuilt_result)
 
-        print("BUILDSYS: start build '{}', {} ...".format(description.module_name, description.module_type))
+        print("BUILDSYS: start build '{}', {},{} ...".format(description.module_name, description.module_type, used_model_name))
 
         if description.explicit_depends and rebuild_level >= 0:
             xpl_depends_desc = []
-            eval_explicit_depends_in_description(loader, description, xpl_depends_desc)
+            eval_explicit_depends_in_description(loader, description, current_model, xpl_depends_desc)
             for xpl_dep_desc in xpl_depends_desc:
                 xpl_dep_cached_result = self._build_cache.get_cached_build_result(xpl_dep_desc, used_model_name)
                 if xpl_dep_cached_result is not None:
                     continue
                 xpl_rebuild_level = 2 if rebuild_level == 2 else 0
-                self._perform_build(xpl_dep_desc, used_model_name, build_config, xpl_rebuild_level, verbose)
+                self._perform_build(xpl_dep_desc, used_model_name, build_config, xpl_rebuild_level)
 
         if description.spec_file:
             noarch_obj_mod_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
@@ -397,17 +464,17 @@ class BuildWorkflow:
             spec_fname_input = normalize_path_optional(description.spec_file, description.self_dirname)
             up_to_date = None
             if rebuild_level <= 0:
-                up_to_date, _ = is_target_up_to_date(spec_fname_stamp, [spec_fname_input], description.self_file_parts, verbose)
+                up_to_date, _ = is_target_up_to_date(spec_fname_stamp, [spec_fname_input], description.self_file_parts, self._verbose)
                 if up_to_date and not os.path.isfile(spec_fname_output):
                     up_to_date = False
                 if up_to_date:
                     with open(spec_fname_output) as fh:
                         files_in_spec = [ x[0] for x in json.load(fh)[TAG_GRAMMAR_KEY_SPEC_FILE] ]
-                    up_to_date, _ = is_target_up_to_date(spec_fname_stamp, files_in_spec, None, verbose)
+                    up_to_date, _ = is_target_up_to_date(spec_fname_stamp, files_in_spec, None, self._verbose)
             if rebuild_level <= 0 and up_to_date:
                 print("BUILDSYS: up-to-date: spec-file for module '{}'".format(description.module_name))
             else:
-                print("BUILDSYS: Processing spec-file for module '{}'".format(description.module_name))
+                print("BUILDSYS: processing spec-file for module '{}'".format(description.module_name))
                 mod_spec_catalog = parse_spec_file(spec_fname_input, self._grammar_substitutions)
                 with open(spec_fname_output, 'wt') as spec_fh:
                     spec_data = {}
@@ -424,12 +491,15 @@ class BuildWorkflow:
                             spec_data[entail_attr] = entail_value
                     json.dump(spec_data, spec_fh, sort_keys=True, indent=4, ensure_ascii=False)
                 if description.spec_post_build:
-                    self._perform_spec_post_build(description, used_model_name, build_config, rebuild_level, verbose)
+                    self._perform_spec_post_build(description, used_model_name, build_config, rebuild_level)
                 with open(spec_fname_stamp, mode='w'):
                     pass
+                if self._faccess:
+                    self._follow_faccess_in_spec_file(mod_spec_catalog)
+
 
         if description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_ZIP_FILE:
-            mod_build_result = build_zip_module(self._sysinfo, self._grammar_substitutions, description, rebuild_level > 0, verbose)
+            mod_build_result = self._build_zip_module(description, rebuild_level > 0)
 
         elif description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_DOWNLOAD:
             force_download = rebuild_level > 0
@@ -438,7 +508,7 @@ class BuildWorkflow:
                 mod_download_post_build_stamp_file = os.path.join(noarch_obj_mod_dir, POST_BUILD_OBJ_STAMP_FILE)
                 if not os.path.isfile(mod_download_post_build_stamp_file):
                     force_download = True
-            mod_build_result = download_files(self._sysinfo, description, force_download, verbose)
+            mod_build_result = download_files(self._sysinfo, description, force_download, self._verbose)
 
         elif description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_COMPOSITE:
             mod_composite_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, current_model.model_name, build_config)
@@ -492,11 +562,11 @@ class BuildWorkflow:
                         raise BuildSystemException("Directory '{}' not found, required in '{}'".format(desc_dir, description.self_file_parts[0]))
                     if not os.path.isdir(desc_dir):
                         raise BuildSystemException("Not a directory '{}', required to be a directory in '{}'".format(desc_dir, description.self_file_parts[0]))
-                    sub_description = loader.load_build_description(desc_dir)
+                    sub_description = loader.load_build_description(desc_dir, current_model)
                     if sub_description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_COMPOSITE:
                         raise BuildSystemException("Build of recursive composites is not supported, provided in '{}'".format(description.self_file_parts[0]))
                     artifacts = []
-                    being_built, _artifacts = self._perform_build(sub_description, used_model_name, build_config, rebuild_level, verbose)
+                    being_built, _artifacts = self._perform_build(sub_description, used_model_name, build_config, rebuild_level)
                     for art in _artifacts:
                         artifacts.append((art, None))
 
@@ -556,7 +626,7 @@ class BuildWorkflow:
                         break
                     mt_src = os.path.getmtime(art_build_path)
                     mt_dst = os.path.getmtime(art_target_path)
-                    if prerequisite_newer_then_target(mt_dst, mt_src, art_target_path, art_build_path, verbose):
+                    if prerequisite_newer_then_target(mt_dst, mt_src, art_target_path, art_build_path, self._verbose):
                         composite_need_rebuild = True
                         break
 
@@ -565,14 +635,16 @@ class BuildWorkflow:
                 for composite_subdir in composite_subdirs_required:
                     mkdir_safe(composite_subdir)
                 for art_build_path, art_target_path, art_build_attr in composite_copy_files_info:
-                        print("BUILDSYS: copy file: '{}' >>> '{}'".format(art_build_path, art_target_path))
-                        art_is_exe = True if art_build_attr & BUILD_RET_ATTR_FLAG_EXECUTABLE else False
-                        art_permissions = make_posix_permissions(art_is_exe)
-                        shutil.copyfile(art_build_path, art_target_path)
-                        shutil.copystat(art_build_path, art_target_path)
-                        if sys.platform != 'win32':
-                            print("BUILDSYS: chmod: '{:04o}' >>> '{}'".format(art_permissions, art_target_path))
-                            os.chmod(art_target_path, art_permissions)
+                    print("BUILDSYS: copy file: '{}' >>> '{}'".format(art_build_path, art_target_path))
+                    art_is_exe = True if art_build_attr & BUILD_RET_ATTR_FLAG_EXECUTABLE else False
+                    art_permissions = make_posix_permissions(art_is_exe)
+                    shutil.copyfile(art_build_path, art_target_path)
+                    shutil.copystat(art_build_path, art_target_path)
+                    if sys.platform != 'win32':
+                        print("BUILDSYS: chmod: '{:04o}' >>> '{}'".format(art_permissions, art_target_path))
+                        os.chmod(art_target_path, art_permissions)
+                    if self._faccess:
+                        self._follow_faccess_for_file(art_build_path)
             else:
                 print("BUILDSYS: up-to-date: '{}', COMPOSITE".format(description.module_name))
 
@@ -590,14 +662,14 @@ class BuildWorkflow:
             if is_exe_or_dll and rebuild_level >= 0:
                 static_libs_deps = []
                 shared_libs_deps = []
-                eval_libs_in_description(loader, description, static_libs_deps, shared_libs_deps)
+                eval_libs_in_description(loader, description, current_model, static_libs_deps, shared_libs_deps)
                 submod_rebuild_level = 2 if rebuild_level == 2 else 0
 
                 for libstatic_desc in static_libs_deps:
                     libstatic_cached_result = self._build_cache.get_cached_build_result(libstatic_desc, used_model_name)
                     if libstatic_cached_result is not None:
                         continue
-                    exe_or_dll_build_dep = self._perform_build(libstatic_desc, used_model_name, build_config, submod_rebuild_level, verbose)
+                    exe_or_dll_build_dep = self._perform_build(libstatic_desc, used_model_name, build_config, submod_rebuild_level)
                     if exe_or_dll_build_dep[0]:
                         exe_or_dll_deps_changed = True
 
@@ -605,7 +677,7 @@ class BuildWorkflow:
                     libshared_cached_result = self._build_cache.get_cached_build_result(libshared_desc, used_model_name)
                     if libshared_cached_result is not None:
                         continue
-                    exe_or_dll_build_dep = self._perform_build(libshared_desc, used_model_name, build_config, submod_rebuild_level, verbose)
+                    exe_or_dll_build_dep = self._perform_build(libshared_desc, used_model_name, build_config, submod_rebuild_level)
                     if exe_or_dll_build_dep[0]:
                         exe_or_dll_deps_changed = True
 
@@ -633,10 +705,14 @@ class BuildWorkflow:
 
             force_mod_rebuild = rebuild_level > 0
             force_src_rebuild = rebuild_level > 0
+
+            src_ctx = ToolsetActionContext(force=force_src_rebuild, verbose=self._verbose, trace=self._trace)
             for action in actions:
-                rebuilt = action(force_src_rebuild, verbose)
-                if rebuilt:
-                    force_mod_rebuild = True
+                self._actions_pool.put(action, src_ctx)
+            src_rebuilt = self._actions_pool.join()
+            if src_rebuilt:
+                force_mod_rebuild = True
+
             if not force_mod_rebuild:
                 if is_exe_or_dll:
                     force_mod_rebuild = exe_or_dll_deps_changed
@@ -674,49 +750,123 @@ class BuildWorkflow:
             if mod_action is None:
                 raise BuildSystemException("Can't create build action for module of type: '{}', provided in: '{}'.".format(description.module_type, description.self_file_parts[0]))
 
-            mod_build_result = mod_action(force_mod_rebuild, verbose)
+            mod_ctx = ToolsetActionContext(force=force_mod_rebuild, verbose=self._verbose, trace=self._trace)
+            mod_action_result = mod_action.safe_execute(mod_ctx)
+            if mod_action_result.exit_code is not None:
+                print(mod_action_result.error_text)
+                raise BuildSystemSysExit(mod_action_result.exit_code)
+
+            mod_build_result = (mod_action_result.rebuilt, mod_action_result.artifacts)
+
+            if self._faccess:
+                faccess_stamps = []
+                faccess_mod_header_refs = set()
+                for build_type, source_path, obj_name in parsed_build_list:
+                    norm_src_path = os.path.normcase(source_path)
+                    faccess_in_interest = False
+                    for faccess_prefix in self._faccess_prefixes:
+                        if norm_src_path.startswith(self._sysinfo[TAG_CFG_PROJECT_OUTPUT_COMMON_PREFIX]):
+                            break
+                        if norm_src_path.startswith(faccess_prefix):
+                            faccess_in_interest = True
+                            break
+                    if not faccess_in_interest:
+                        continue
+                    norm_src_path = source_path[len(self._sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX]):]
+                    faccess_stamp_file = os.path.join(self._sysinfo[TAG_CFG_DIR_FACCESS], norm_src_path)
+                    faccess_stamps += [ (norm_src_path.replace('\\', '/'), faccess_stamp_file) ]
+                    facccess_dep_file = os.path.join(mod_obj_dir, obj_name + self._sysinfo[TAG_CFG_DEP_SUFFIX])
+                    headers_refs = load_py_object(facccess_dep_file)
+                    for header_ref in headers_refs:
+                        header_ref_norm = os.path.normcase(os.path.normpath(header_ref))
+                        if header_ref_norm in faccess_mod_header_refs:
+                            continue
+                        faccess_mod_header_refs.add(header_ref_norm)
+                        faccess_header_in_interest = False
+                        for faccess_prefix in self._faccess_prefixes:
+                            norm_header_path = self._sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX] + header_ref_norm
+                            if norm_header_path.startswith(self._sysinfo[TAG_CFG_PROJECT_OUTPUT_COMMON_PREFIX]):
+                                break
+                            if norm_header_path.startswith(faccess_prefix):
+                                faccess_header_in_interest = True
+                                break
+                        if not faccess_header_in_interest:
+                            continue
+                        header_relpath = os.path.normpath(header_ref)
+                        faccess_stamp_file = os.path.join(self._sysinfo[TAG_CFG_DIR_FACCESS], header_relpath)
+                        faccess_stamps += [ (header_relpath.replace('\\', '/'), faccess_stamp_file) ]
+                if current_model.platform_name == TAG_PLATFORM_WINDOWS:
+                    if description.module_type in [TAG_GRAMMAR_VALUE_MODULE_TYPE_EXE, TAG_GRAMMAR_VALUE_MODULE_TYPE_LIB_SHARED]:
+                        faccess_rc_file = verify_winrc_file(description)
+                        if faccess_rc_file:
+                            self._follow_faccess_for_file(faccess_rc_file)
+                if description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_LIB_SHARED:
+                    faccess_def_file = verify_exports_def_file(description)
+                    if faccess_def_file:
+                        self._follow_faccess_for_file(faccess_def_file)
+                for faccess_relpath, faccess_stamp_file in faccess_stamps:
+                    if self._verbose:
+                        print("BUILDSYS: FACCESS: {}".format(faccess_relpath))
+                    mkdir_safe(os.path.dirname(faccess_stamp_file))
+                    with open(faccess_stamp_file, 'wb'):
+                        pass
 
         if mod_build_result[0]:
             if description.post_build:
-                self._perform_post_build(description, used_model_name, build_config, rebuild_level, verbose)
+                self._perform_post_build(description, used_model_name, build_config, rebuild_level)
 
         self._build_cache.cache_build_result(description, used_model_name, mod_build_result[1])
-        print("BUILDSYS: finish build '{}', {}".format(description.module_name, description.module_type))
+        print("BUILDSYS: finish build '{}', {},{}".format(description.module_name, description.module_type, used_model_name))
         return mod_build_result
 
-    def _create_ext_action(self, expected_ext_type, ext_name, description, used_model_name, build_config, rebuild_level, verbose):
+    def _create_ext_action(self, expected_ext_type, ext_name, description, used_model_name, build_config, rebuild_level):
         if not ext_name in self._imported_extensions or not description._buildsys_import_list or not ext_name in description._buildsys_import_list:
             raise BuildSystemException("Build extension '{}' is unknown (or not imported), got from '{}'.".format(ext_name, description.self_file_parts[0]))
         ext_description = self._imported_extensions[ext_name].description
         if ext_description.ext_type != expected_ext_type:
             raise BuildSystemException("Type info mismatched in build extension '{}': got '{}', but expected '{}'.".format(ext_name, ext_description.ext_type, expected_ext_type))
+        action = None
+        try:
+            self._ext_protector.inc_ref(ext_description, used_model_name)
+            action = self._create_ext_action_imp(ext_description, description, used_model_name, build_config, rebuild_level)
+        finally:
+            self._ext_protector.dec_ref(ext_description, used_model_name)
+        return action
 
-        if ext_description.ext_native_depends is not None:
+    def _create_ext_action_imp(self, ext_description, description, used_model_name, build_config, rebuild_level):
+        ext_ref_count = self._ext_protector.ref_count(ext_description, used_model_name)
+        if ext_ref_count > 2:
+            raise BuildSystemException("Got unexpected recursive call from '{}'.".format(ext_description.self_file_parts[0]))
+
+        native_toolset = None
+        native_loader = None
+        native_model = None
+        if ext_description.ext_native_depends is not None or ext_description.ext_obj_dir_native_as_var is not None:
             if self._native_model_remap is None:
                 raise BuildSystemException("Native model is not defined, required by '{}'.".format(ext_description.self_file_parts[0]))
+            native_toolset, native_loader = self._toolset_models_mapping[self._native_model_remap]
+            native_model = native_toolset.supported_models[self._native_model_remap]
+
+        if ext_description.ext_native_depends is not None:
             ext_private_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_EXT], ext_description.ext_name)
             mkdir_safe(ext_private_dir)
             stamp_fname = 'depends-{}-{}.stamp'.format(self._native_model_remap, build_config)
             stamp_path = os.path.join(ext_private_dir, stamp_fname)
-            up_to_date, _ = is_target_up_to_date(stamp_path, None, ext_description.self_file_parts, verbose)
+            up_to_date, _ = is_target_up_to_date(stamp_path, None, ext_description.self_file_parts, self._verbose)
             if rebuild_level > 1 or (not up_to_date and rebuild_level >= 0):
-                submod_rebuild_level = 2 if rebuild_level == 2 else 0
-                _, native_loader = self._toolset_models_mapping[self._native_model_remap]
+                submod_rebuild_level = 2 if rebuild_level == 2 and ext_ref_count < 2 else 0
                 for dep_ref in ext_description.ext_native_depends:
                     dep_dir = normalize_path_optional(dep_ref, ext_description.self_dirname)
-                    dep_desc = native_loader.load_build_description(dep_dir, required_by=ext_description.self_file_parts[0])
-                    self._perform_build(dep_desc, self._native_model_remap, build_config, submod_rebuild_level, verbose)
+                    dep_desc = native_loader.load_build_description(dep_dir, native_model, required_by=ext_description.self_file_parts[0])
+                    self._perform_build(dep_desc, self._native_model_remap, build_config, submod_rebuild_level)
                 with open(stamp_path, mode='w'):
                     pass
 
         local_vars = {}
         if ext_description.ext_obj_dir_native_as_var is not None:
-            if self._native_model_remap is None:
-                raise BuildSystemException("Native model is not defined, required by '{}'.".format(ext_description.self_file_parts[0]))
-            _, native_loader = self._toolset_models_mapping[self._native_model_remap]
             for local_var_name, module_ref in ext_description.ext_obj_dir_native_as_var:
                 module_dir = normalize_path_optional(module_ref, ext_description.self_dirname)
-                module_desc = native_loader.load_build_description(module_dir, required_by=ext_description.self_file_parts[0])
+                module_desc = native_loader.load_build_description(module_dir, native_model, required_by=ext_description.self_file_parts[0])
                 module_obj_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], module_desc.module_name, self._native_model_remap, build_config)
                 local_vars[local_var_name] = module_obj_dir
 
@@ -769,13 +919,13 @@ class BuildWorkflow:
         if not argv:
             raise BuildSystemException("Malformed value '{}' in extension token '{}', command-line is empty, got from '{}'.".format(
                 cmdline_value, TAG_GRAMMAR_KEY_EXT_CALL_CMDLINE, ext_description.self_file_parts[0]))
-        ext_action = ExtAction(ext_description.ext_type, ext_name, description.module_name, verbose, argv)
+        ext_action = ExtAction(ext_description.ext_type, ext_description.ext_name, description.module_name, self._verbose, argv)
         return ext_action
 
-    def _perform_post_build(self, description, used_model_name, build_config, rebuild_level, verbose):
+    def _perform_post_build(self, description, used_model_name, build_config, rebuild_level):
         for ext_name in description.post_build:
             ext_action = self._create_ext_action(TAG_GRAMMAR_VALUE_EXT_TYPE_POST_BUILD, ext_name,
-                description, used_model_name, build_config, rebuild_level, verbose)
+                description, used_model_name, build_config, rebuild_level)
             ext_action()
         if description.module_type in (TAG_GRAMMAR_VALUE_MODULE_TYPE_ZIP_FILE, TAG_GRAMMAR_VALUE_MODULE_TYPE_DOWNLOAD):
             mod_obj_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
@@ -785,8 +935,8 @@ class BuildWorkflow:
         with open(mod_post_build_stamp_file, mode='w'):
             pass
 
-    def _perform_spec_post_build(self, description, used_model_name, build_config, rebuild_level, verbose):
+    def _perform_spec_post_build(self, description, used_model_name, build_config, rebuild_level):
         for ext_name in description.spec_post_build:
             ext_action = self._create_ext_action(TAG_GRAMMAR_VALUE_EXT_TYPE_SPEC_POST_BUILD, ext_name,
-                description, used_model_name, build_config, rebuild_level, verbose)
+                description, used_model_name, build_config, rebuild_level)
             ext_action()

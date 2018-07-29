@@ -53,4 +53,4 @@ def parse_traceback_of_makefile(etype, value, tb, issuer_fname, issuer_output, i
 
 
 def format_makefile_exception(etype, value):
-    return _parse_traceback_of_file(etype, value, None, None, None, None)
+    return parse_traceback_of_makefile(etype, value, None, None, None, None)
