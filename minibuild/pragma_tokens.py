@@ -121,7 +121,7 @@ def load_buildconf_pragmas(fname, sys_platform):
             if not pragma_id:
                 raise BuildSystemException("Can't load makefile: '{}', got malformed instruction #pragma at line: {}, no tokens.".format(fname, idx))
             if pragma_id not in TAG_KNOWN_PRAGMA_TOKENS:
-                raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, got unknown token '{}'.".format(fname, idx, pragma_token))
+                raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, got unknown token '{}'.".format(fname, idx, pragma_id))
             pragma_options = {}
             del pragma_args[0]
             for arg in pragma_args:

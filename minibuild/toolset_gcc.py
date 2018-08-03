@@ -19,6 +19,7 @@ from .nasm_action import NasmSourceBuildAction
 from .os_utils import *
 from .string_utils import escape_string, argv_to_rsp
 from .toolset_base import ToolsetBase, ToolsetModel, ToolsetActionBase, ToolsetActionResult
+from .osxapi_level import *
 from .winapi_level import *
 from .winrc_manifest import WINRC_MANIFEST
 
@@ -29,6 +30,7 @@ GCC_MODEL_LINUX_ARM = 'gcc-linux-arm'
 GCC_MODEL_LINUX_ARM64 = 'gcc-linux-arm64'
 
 CLANG_MODEL_MACOSX_X86_64 = 'clang-macosx-x86_64'
+CLANG_CROSSTOOL_MODEL_MACOSX_X86_64 = 'clang-xt-macosx-x86_64'
 
 GCC_CROSSTOOL_MODEL_LINUX_X86 = 'gcc-xt-linux-x86'
 GCC_CROSSTOOL_MODEL_LINUX_X86_64 = 'gcc-xt-linux-x86_64'
@@ -180,9 +182,11 @@ class SourceBuildActionGCC(ToolsetActionBase):
 
         argv = [self.tools.gpp, '-Werror-implicit-function-declaration']
         argv += self.arch_flags
+        if self.tools.sysroot:
+            argv += ['-isysroot', self.tools.sysroot]
 
         if self.source_type == BUILD_TYPE_CPP:
-            argv += ['-x', 'c++']
+            argv += ['-x', 'c++', '-std=c++11']
         elif self.source_type == BUILD_TYPE_C:
             argv += ['-x', 'c']
         elif self.source_type == BUILD_TYPE_ASM:
@@ -214,7 +218,7 @@ class SourceBuildActionGCC(ToolsetActionBase):
 
         argv += [ '-c', '-o', self.obj_path, self.source_path ]
 
-        ctx.subprocess_communicate(output, argv, issuer=self.source_path, title=os.path.basename(self.source_path))
+        ctx.subprocess_communicate(output, argv, issuer=self.source_path, title=os.path.basename(self.source_path), env=self.tools.env)
 
         depends = parse_gnu_makefile_depends(self.common_prefix, self.source_path, self.deptmp_path, self.obj_path)
         with open(self.dep_path, mode='wt') as dep_content:
@@ -229,18 +233,18 @@ class StaticLibLinkActionGCC(ToolsetActionBase):
     def __init__(self, tools, sysinfo, description, lib_directory, obj_directory, obj_names, build_model, build_config):
         self.tools = tools
         self.module_name = description.module_name
-        self.rsp_file = os.path.join(obj_directory, self.module_name + '.rsplnk')
+        self.obj_directory = obj_directory
+        self.rsp_fname = self.module_name + '.rsplnk'
         self.outlib_path = os.path.join(lib_directory, 'lib' + self.module_name + '.a')
-        self.obj_list = []
+        self.obj_fnames = []
         self.primary_deps = []
 
         for obj_name in obj_names:
-            obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
-            self.obj_list.append(obj_path)
-            self.primary_deps.append(obj_path)
+            obj_fname = obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX]
+            self.obj_fnames.append(obj_fname)
+            self.primary_deps.append(os.path.join(obj_directory, obj_fname))
 
-        self.extra_deps = []
-        self.extra_deps.extend(description.self_file_parts)
+        self.extra_deps = description.self_file_parts[:]
 
     def execute(self, output, ctx):
         build_result = [BuildArtifact(BUILD_RET_TYPE_LIB, self.outlib_path, BUILD_RET_ATTR_DEFAULT)]
@@ -254,17 +258,14 @@ class StaticLibLinkActionGCC(ToolsetActionBase):
 
         output.report_message("BUILDSYS: create LIB module '{}' ...".format(self.module_name))
 
-        if self.tools.is_clang:
-            with open(self.rsp_file, mode='wt') as rsp_fh:
-                for rsp_entry in self.obj_list:
-                    rsp_fh.writelines([rsp_entry, '\n'])
-            argv = [self.tools.ar, '-static', '-filelist', self.rsp_file, '-o', self.outlib_path]
+        with open(os.path.join(self.obj_directory, self.rsp_fname), mode='wt') as rsp_fh:
+            for rsp_entry in self.obj_fnames:
+                rsp_fh.writelines([rsp_entry, '\n'])
+        if self.tools.is_clang and not self.tools.is_crosstool:
+            argv = [self.tools.ar, '-static', '-filelist', self.rsp_fname, '-o', self.outlib_path]
         else:
-            argv = [self.tools.ar, 'ru', self.outlib_path]
-            argv += self.obj_list
-            argv = argv_to_rsp(argv, self.rsp_file)
-
-        ctx.subprocess_communicate(output, argv, issuer=self.outlib_path)
+            argv = [self.tools.ar, 'rcs', self.outlib_path, '@' + self.rsp_fname ]
+        ctx.subprocess_communicate(output, argv, issuer=self.outlib_path, env=self.tools.env, cwd=self.obj_directory)
         return ToolsetActionResult(rebuilt=True, artifacts=build_result)
 
 
@@ -273,6 +274,7 @@ class LinkActionGCC(ToolsetActionBase):
         self.tools = tools
         self.sharedlib_directory = sharedlib_directory
         self.is_dll = True if exe_directory is None else False
+        self.obj_directory = obj_directory
         self.link_public_dir = sharedlib_directory if self.is_dll else exe_directory
         self.link_private_dir = os.path.join(obj_directory, 'raw')
         self.link_stamp_file = os.path.join(self.link_private_dir, 'link.stamp')
@@ -342,14 +344,14 @@ class LinkActionGCC(ToolsetActionBase):
                 self.manifest_res_file = None
 
         self.rsp_file = os.path.join(self.link_private_dir, self.module_name_private + '.rsplnk')
-        self.obj_list = []
+        self.obj_fnames = []
         self.arch_flags = []
         self.arch_flags += build_model.get_arch_link_flags(description)
         self.build_config = build_config
         for obj_name in obj_names:
-            obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
-            self.obj_list.append(obj_path)
-            self.primary_deps.append(obj_path)
+            obj_fname = obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX]
+            self.obj_fnames.append(obj_fname)
+            self.primary_deps.append(os.path.join(obj_directory, obj_fname))
         self.link_libstatic_names = []
         self.link_libshared_names = []
         eval_libnames_in_description(loader, description, build_model, self.link_libstatic_names, self.link_libshared_names)
@@ -385,7 +387,7 @@ class LinkActionGCC(ToolsetActionBase):
                     argv += [ '-I{}'.format(incd) ]
                 for defrc in self.winrc_definitions:
                     argv += [ '-D{}'.format(defrc) ]
-                ctx.subprocess_communicate(output, argv, issuer=self.winrc_file, title=os.path.basename(self.winrc_file))
+                ctx.subprocess_communicate(output, argv, issuer=self.winrc_file, title=os.path.basename(self.winrc_file), env=self.tools.env)
 
             if self.manifest_res_file is not None:
                 manifest_builtin = os.path.join(self.link_private_dir, self.module_name_private + '.manifest')
@@ -399,7 +401,7 @@ class LinkActionGCC(ToolsetActionBase):
                         '{} RT_MANIFEST {}\n'.format(manifest_id, self.module_name_private + '.manifest')
                     ])
                 argv = [self.tools.windres, manifest_rc, self.manifest_res_file]
-                ctx.subprocess_communicate(output, argv, issuer=manifest_rc, title=os.path.basename(manifest_rc))
+                ctx.subprocess_communicate(output, argv, issuer=manifest_rc, title=os.path.basename(manifest_rc), env=self.tools.env)
 
         argv = [ self.tools.gpp ]
         argv += self.arch_flags
@@ -466,7 +468,7 @@ class LinkActionGCC(ToolsetActionBase):
             if self.manifest_res_file is not None:
                 argv += [ self.manifest_res_file ]
 
-        argv += self.obj_list
+        argv += self.obj_fnames
 
         if not self.tools.is_clang:
             argv += ['-static-libgcc']
@@ -503,13 +505,20 @@ class LinkActionGCC(ToolsetActionBase):
                 argv += [ '-framework', framework_name ]
 
         argv = argv_to_rsp(argv, self.rsp_file)
-        ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private)
+        ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private, env=self.tools.env, cwd=self.obj_directory)
 
         if self.macosx_install_name_options:
-            argv = ['install_name_tool']
+            install_name_tool = 'install_name_tool'
+            if self.tools.bin_prefix:
+                install_name_tool = self.tools.bin_prefix + install_name_tool
+            if sys.platform == 'win32':
+                install_name_tool = install_name_tool + '.exe'
+            if self.tools.dir_prefix:
+                install_name_tool = os.path.join(self.tools.dir_prefix, install_name_tool)
+            argv = [install_name_tool]
             argv += self.macosx_install_name_options
             argv += [ self.bin_path_private ]
-            ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private)
+            ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private, env=self.tools.env)
 
         if self.zip_section is not None:
             if not os.path.isfile(self.zip_section):
@@ -639,16 +648,46 @@ class ToolsetGCC(ToolsetBase):
                 models.append(model_win64)
 
         elif self._tools.is_crosstool:
-            self._platform_name = TAG_PLATFORM_LINUX
+            if self._tools.crosstool_target_platform == TAG_PLATFORM_LINUX:
+                self._platform_name = TAG_PLATFORM_LINUX
 
-            for x_arch in self._tools.arch_list:
-                x_model_name = CROSSTOOL_MODEL_NAMES[x_arch]
-                x_is_native = CROSSTOOL_NATIVE_STATUS[x_arch]
+                for x_arch in self._tools.arch_list:
+                    x_model_name = CROSSTOOL_MODEL_NAMES[x_arch]
+                    x_is_native = CROSSTOOL_NATIVE_STATUS[x_arch]
+
+                    x_model = GccModel(
+                        model_name=x_model_name, toolset_version=toolset_version, is_native=x_is_native,
+                        target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=x_arch,
+                        arch_flags=[], arch_link_flags=[], crosstool=True)
+
+                    models.append(x_model)
+
+            elif self._tools.crosstool_target_platform == TAG_PLATFORM_MACOSX and self._tools.is_clang and self._tools.arch_list == [TAG_ARCH_X86_64]:
+                self._platform_name = TAG_PLATFORM_MACOSX
+
+                x_is_native = is_macosx_x86_64()
+                sdk_path = self._tools.sysroot
+                osxapi_level_x86_64 = self._tools.api_levels[TAG_ARCH_X86_64]
+                if not osxapi_level_x86_64:
+                    osxapi_level_x86_64 = MACOSX_API_DEFAULT_LEVEL[TAG_ARCH_X86_64]
+
+                x_arch_flags = [
+                    '-target', 'x86_64-apple-darwin',
+                    '-mmacosx-version-min=' + osxapi_level_x86_64,
+                ]
+
+                x_arch_link_flags = [
+                    '-target', 'x86_64-apple-darwin',
+                    '-mmacosx-version-min=' + osxapi_level_x86_64,
+                    '-Wl,-syslibroot,' + sdk_path,
+                    '-L' + os.path.normpath(os.path.join(sdk_path, 'usr/lib/system')),
+                    '-F' + os.path.normpath(os.path.join(sdk_path, 'System/Library/Frameworks')),
+                ]
 
                 x_model = GccModel(
-                    model_name=x_model_name, toolset_version=toolset_version, is_native=x_is_native,
-                    target_os=TAG_PLATFORM_LINUX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=x_arch,
-                    arch_flags=[], arch_link_flags=[], crosstool=True)
+                    model_name=CLANG_CROSSTOOL_MODEL_MACOSX_X86_64, toolset_version=toolset_version, is_native=x_is_native,
+                    target_os=TAG_PLATFORM_MACOSX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86_64,
+                    arch_flags=x_arch_flags, arch_link_flags=x_arch_link_flags, crosstool=True)
 
                 models.append(x_model)
 
@@ -713,8 +752,9 @@ class ToolsetGCC(ToolsetBase):
                 platform = sys.platform
                 if platform.startswith('linux'):
                     platform = 'linux'
-                machine = os.uname()[4]
-                raise BuildSystemException("Unsupported platform: '{},{}'".format(platform, machine))
+                if hasattr(os, 'uname'):
+                    platform = platform + ',' + os.uname()[4]
+                raise BuildSystemException("Unsupported platform: '{}'".format(platform))
 
         self._models = {}
         for model in models:
@@ -766,11 +806,22 @@ class ToolsetGCC(ToolsetBase):
 
 
 class ToolsInfoGCC:
-    def __init__(self, dir_prefix=None, bin_prefix=None, is_mingw=None, is_clang=None, is_crosstool=None, arch_list=None, nasm=None, api_levels=None):
+    def __init__(self, dir_prefix=None, sysroot=None, bin_prefix=None, is_mingw=None, is_clang=None, is_crosstool=None, arch_list=None, nasm=None, api_levels=None, toolset_version=None, crosstool_target_platform=None, env=None):
         tool_gcc = 'clang' if is_clang else 'gcc'
         tool_gpp = 'clang' if is_clang else 'g++'
-        tool_ar  = 'libtool' if is_clang else 'ar'
+        tool_ar  = 'libtool' if is_clang and not is_crosstool else 'ar'
         tool_windres = 'windres' if is_mingw else None
+
+        if is_crosstool:
+            if crosstool_target_platform not in [TAG_PLATFORM_LINUX, TAG_PLATFORM_MACOSX]:
+                raise BuildSystemException("Got unsupported target platform '{}' for cross build.".format(crosstool_target_platform))
+
+        if sys.platform == 'win32':
+            tool_gcc = tool_gcc + '.exe'
+            tool_gpp = tool_gpp + '.exe'
+            tool_ar  = tool_ar  + '.exe'
+            if tool_windres is not None:
+                tool_windres = tool_windres + '.exe'
 
         if bin_prefix is not None:
             tool_gcc = bin_prefix + tool_gcc
@@ -786,9 +837,14 @@ class ToolsInfoGCC:
             if tool_windres is not None:
                 tool_windres = os.path.join(dir_prefix, tool_windres)
 
+        self.bin_prefix = bin_prefix
+        self.dir_prefix = dir_prefix
+        self.env = env
         self.is_mingw = is_mingw
         self.is_clang = is_clang
         self.is_crosstool = is_crosstool
+        self.crosstool_target_platform = crosstool_target_platform
+        self.sysroot = sysroot
         self.arch_list = arch_list
         self.api_levels = api_levels
 
@@ -798,6 +854,7 @@ class ToolsInfoGCC:
         self.windres = tool_windres
         self.nasm_executable = nasm if nasm else 'nasm'
         self.nasm_enabled = False
+        self.toolset_version = toolset_version
 
         if is_mingw:
             self.nasm_enabled = True
@@ -813,7 +870,17 @@ class ToolsInfoGCC:
 
     def eval_version_info(self):
         argv = [self.gpp, '--version']
-        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        p = None
+        errmsg = None
+        try:
+            p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        except Exception as ex:
+            errmsg = str(ex)
+        if p is None:
+            errmsg = 'Subprocess communication failed\n  ' + ' '.join(argv) + '\n    ' + errmsg
+            raise BuildSystemException(errmsg)
+        if self.toolset_version:
+            return self.toolset_version
         version_text, _ = p.communicate()
         version_bits = version_text.split('\n')
         if version_bits and version_bits[0] and version_bits[0].rstrip('\r\n').strip():
@@ -832,81 +899,99 @@ class ToolsInfoGCC:
         return version
 
 
-def init_mingw_tools(sysinfo, mingw, nasm):
-    package_path = mingw.get('package_path')
-    if package_path is None:
-        raise BuildSystemException("Malformed MinGW config: 'package_path' is not given in project config file.")
-    package_path = os.path.normpath(os.path.expanduser(package_path))
-    if not os.path.isabs(package_path):
-        package_path = os.path.join(sysinfo[TAG_CFG_DIR_PROJECT_ROOT], package_path)
-    if not os.path.isdir(package_path):
-        raise BuildSystemException("Malformed MinGW config: 'package_path' resolved as '{}' is not a directory.".format(package_path))
-    package_path_bin = os.path.join(package_path, 'bin')
-    if not os.path.isdir(package_path_bin):
-        raise BuildSystemException("Malformed MinGW config: '{}' is not a directory.".format(package_path_bin))
-    bin_prefix = mingw.get('prefix')
-    arch_list = mingw.get('arch')
-    if not isinstance(arch_list, list) or not arch_list:
-        raise BuildSystemException("Malformed MinGW config: 'arch' list is not given or empty in project config file.")
-    arch_parsed = []
-    api_levels = {}
-    for arch in arch_list:
-        winapi_level = None
-        if ':' in arch:
-            arch_value, winapi_level = arch.split(':', 1)
-            winapi_level = winapi_level.strip()
-        else:
-            arch_value = arch
-        if arch_value not in TAG_ALL_KNOWN_MINGW_ARCH_LIST:
-            raise BuildSystemException("Malformed MinGW config: unknown arch value '{}' is given. Only the following values are supported: {}.".format(arch_value, ', '.join(TAG_ALL_KNOWN_MINGW_ARCH_LIST)))
-        if not winapi_level:
-            winapi_level = WINDOWS_API_DEFAULT_LEVEL[arch]
-        else:
-            if winapi_level not in WINDOWS_API_LEVELS:
-                raise BuildSystemException("Malformed MinGW config: unknown Windows API level '{}' is given. Only the following values are supported: {}.".format(winapi_level, ', '.join(WINDOWS_API_LEVELS)))
-        arch_parsed.append(arch_value)
-        api_levels[arch_value] = winapi_level
-
-    tools = ToolsInfoGCC(dir_prefix=package_path_bin, bin_prefix=bin_prefix, is_mingw=True, arch_list=arch_parsed, nasm=nasm, api_levels=api_levels)
-    return tools
-
-
-def init_cross_tools(sysinfo, xtools_cfg, nasm):
+def init_cross_tools(crosstools_title, sysinfo, toolset_name, target_platform, xtools_cfg, nasm, arch_list_enabled, api_levels_enabled, api_levels_default=None):
     package_path = xtools_cfg.get('package_path')
+    sysroot_path = xtools_cfg.get('sysroot')
+    toolset_version = xtools_cfg.get('version')
+
     if package_path is None:
-        raise BuildSystemException("Malformed cross-tools config: 'package_path' is not given in project config file.")
+        raise BuildSystemException("Malformed {} config: 'package_path' is not given in project config file.".format(crosstools_title))
     package_path = os.path.normpath(os.path.expanduser(package_path))
     if not os.path.isabs(package_path):
         package_path = os.path.join(sysinfo[TAG_CFG_DIR_PROJECT_ROOT], package_path)
     if not os.path.isdir(package_path):
-        raise BuildSystemException("Malformed cross-tools config: 'package_path' resolved as '{}' is not a directory.".format(package_path))
+        raise BuildSystemException("Malformed {} config: 'package_path' resolved as '{}' is not a directory.".format(crosstools_title, package_path))
     package_path_bin = os.path.join(package_path, 'bin')
     if not os.path.isdir(package_path_bin):
-        raise BuildSystemException("Malformed cross-tools config: '{}' is not a directory.".format(package_path_bin))
+        raise BuildSystemException("Malformed {} config: '{}' is not a directory.".format(crosstools_title, package_path_bin))
+
+    if sysroot_path:
+        sysroot_path = os.path.normpath(os.path.expanduser(sysroot_path))
+        if not os.path.isdir(sysroot_path):
+            raise BuildSystemException("Malformed {} config: '{}' is not a directory.".format(crosstools_title, sysroot_path))
 
     cross_arch_list = xtools_cfg.get('arch')
     if not isinstance(cross_arch_list, list) or not cross_arch_list:
-        raise BuildSystemException("Malformed cross-tools config: 'arch' list is not given or empty in project config file.")
+        raise BuildSystemException("Malformed {} config: 'arch' list is not given or empty in project config file.".format(crosstools_title))
 
+    arch_parsed = []
+    api_levels = {}
     for arch in cross_arch_list:
-        if arch not in TAG_ALL_KNOWN_ARCH_LIST:
-            raise BuildSystemException("Malformed cross-tools config: unknown arch value '{}' is given. The following are supported: {}.".format(arch, ', '.join(TAG_ALL_KNOWN_ARCH_LIST)))
+        api_level = None
+        if ':' in arch:
+            arch_value, api_level = arch.split(':', 1)
+            api_level = api_level.strip()
+        else:
+            arch_value = arch
+            api_level = None
+        if arch_value not in arch_list_enabled:
+            raise BuildSystemException("Malformed {} config: unknown arch value '{}' is given. Only the following values are supported: {}.".format(crosstools_title, arch_value, ', '.join(arch_list_enabled)))
+        if api_levels_enabled is not None:
+            if not api_level:
+                api_level = api_levels_default[arch_value]
+            elif api_level not in api_levels_enabled:
+                raise BuildSystemException("Malformed {} config: unknown API level '{}' is given. Only the following values are supported: {}.".format(crosstools_title, api_level, ', '.join(api_levels_enabled)))
+        else:
+            if not api_level:
+                api_level = None
+        arch_parsed.append(arch_value)
+        api_levels[arch_value] = api_level
 
     bin_prefix = xtools_cfg.get('prefix')
-    tools = ToolsInfoGCC(dir_prefix=package_path_bin, bin_prefix=bin_prefix, is_crosstool=True, arch_list=cross_arch_list, nasm=nasm)
+    is_clang = True if toolset_name == 'clang' else False
+    if target_platform == TAG_PLATFORM_WINDOWS:
+        is_crosstool = False
+        is_mingw = True
+    else:
+        is_crosstool = True
+        is_mingw = False
+
+    custom_env = None
+    if is_clang:
+        custom_env = {}
+        custom_env.update(os.environ)
+        custom_env['COMPILER_PATH'] = package_path_bin
+
+    tools = ToolsInfoGCC(dir_prefix=package_path_bin, sysroot=sysroot_path, bin_prefix=bin_prefix, is_crosstool=is_crosstool, is_mingw=is_mingw, crosstool_target_platform=target_platform,
+                        is_clang=is_clang, arch_list=arch_parsed, api_levels=api_levels, toolset_version=toolset_version, nasm=nasm, env=custom_env)
     return tools
+
+
+def _create_clang_toolset(sysinfo, loader, **kwargs):
+    nasm_executable = kwargs.get('nasm_executable')
+    if 'macosx-xtools' in kwargs:
+        xtools_cfg = kwargs['macosx-xtools']
+        cross_tools = init_cross_tools('MacOSX cross-tools', sysinfo, 'clang', TAG_PLATFORM_MACOSX, xtools_cfg, nasm_executable,
+                                     arch_list_enabled=[TAG_ARCH_X86_64], api_levels_enabled=None)
+        return ToolsetGCC('clang', cross_tools, sysinfo, loader)
+
+    clang_tools = ToolsInfoGCC(is_clang=True, nasm=nasm_executable)
+    return ToolsetGCC('clang', clang_tools, sysinfo, loader)
 
 
 def create_toolset(sysinfo, loader, **kwargs):
     nasm_executable = kwargs.get('nasm_executable')
     if 'mingw' in kwargs:
         mingw = kwargs['mingw']
-        mingw_tools = init_mingw_tools(sysinfo, mingw, nasm_executable)
+        mingw_tools = init_cross_tools('MinGW', sysinfo, 'gcc', TAG_PLATFORM_WINDOWS, mingw, nasm_executable,
+                                     arch_list_enabled=TAG_ALL_KNOWN_MINGW_ARCH_LIST, api_levels_enabled=WINDOWS_API_LEVELS, api_levels_default=WINDOWS_API_DEFAULT_LEVEL)
+
         return ToolsetGCC('gcc', mingw_tools, sysinfo, loader)
 
-    if 'x-tools' in kwargs:
-        xtools_cfg = kwargs['x-tools']
-        cross_tools = init_cross_tools(sysinfo, xtools_cfg, nasm_executable)
+    if 'xtools' in kwargs:
+        xtools_cfg = kwargs['xtools']
+        cross_tools = init_cross_tools('cross-tools', sysinfo, 'gcc', TAG_PLATFORM_LINUX, xtools_cfg, nasm_executable,
+                                     arch_list_enabled=TAG_ALL_KNOWN_ARCH_LIST, api_levels_enabled=None)
         return ToolsetGCC('gcc', cross_tools, sysinfo, loader)
 
     gcc_tools = ToolsInfoGCC(nasm=nasm_executable)
@@ -981,6 +1066,8 @@ def _describe_toolset_imp(native_id, config_proto, pragma_line, sys_platform, sy
         required = xtools.get('required', 0)
         xtools_package = xtools.get('package')
         xtools_prefix = xtools.get('prefix')
+        xtools_version = xtools.get('version')
+        xtools_sysroot = xtools.get('sysroot')
         if not xtools_package:
             raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'package' directory is not given.".format(config_proto, pragma_line))
         if not os.path.isdir(os.path.expanduser(xtools_package)):
@@ -988,6 +1075,9 @@ def _describe_toolset_imp(native_id, config_proto, pragma_line, sys_platform, sy
                 print("BUILDSYS: makefile: '{}', line: {}\n  crosstools 'package' directory not found: '{}'".format(config_proto, pragma_line, xtools_package))
                 return None, None, None, None
             raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'package' directory not found: '{}'.".format(config_proto, pragma_line, xtools_package))
+        if xtools_sysroot is not None:
+            if not os.path.isdir(os.path.expanduser(xtools_sysroot)):
+                raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'sysroot' directory not found: '{}'.".format(config_proto, pragma_line, xtools_sysroot))
         xtools_parts += ["'package_path':'{}'".format(escape_string(xtools_package))]
         if xtools_prefix:
             xtools_parts += ["'prefix':'{}'".format(xtools_prefix)]
@@ -998,12 +1088,62 @@ def _describe_toolset_imp(native_id, config_proto, pragma_line, sys_platform, sy
         if not xtools_arch_list:
             raise BuildSystemException("Can't process makefile: '{}', line: {}, token 'arch' is malformed: '{}'".format(config_proto, pragma_line, xtools_arch))
         xtools_parts += ["'arch':['{}']".format("','".join(xtools_arch_list))]
+        if xtools_sysroot:
+            xtools_parts += ["'sysroot':'{}'".format(escape_string(xtools_sysroot))]
+        if xtools_version:
+            xtools_parts += ["'version':'{}'".format(xtools_version)]
 
         toolset_id = 'xtools-{}'.format('-'.join(sorted(xtools_arch_list)))
-        config_parts += ["'x-tools':{{{}}}".format(','.join(xtools_parts))]
+        config_parts += ["'xtools':{{{}}}".format(','.join(xtools_parts))]
 
         for arch in xtools_arch_list:
             models_per_arch[arch] = CROSSTOOL_MODEL_NAMES[arch]
+
+    elif 'macosx-xtools' in kwargs:
+        xtools_parts = []
+        xtools = kwargs['macosx-xtools']
+        required = xtools.get('required', 0)
+        xtools_package = xtools.get('package')
+        xtools_prefix = xtools.get('prefix')
+        xtools_version = xtools.get('version')
+        xtools_sysroot = xtools.get('sysroot')
+        xtools_arch = xtools.get('arch')
+
+        if not xtools_package:
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'package' directory is not given.".format(config_proto, pragma_line))
+        if not os.path.isdir(os.path.expanduser(xtools_package)):
+            if not required:
+                print("BUILDSYS: makefile: '{}', line: {}\n  crosstools 'package' directory not found: '{}'".format(config_proto, pragma_line, xtools_package))
+                return None, None, None, None
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'package' directory not found: '{}'.".format(config_proto, pragma_line, xtools_package))
+
+        if xtools_sysroot is not None:
+            if not os.path.isdir(os.path.expanduser(xtools_sysroot)):
+                raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'sysroot' directory not found: '{}'.".format(config_proto, pragma_line, xtools_sysroot))
+        else:
+            raise BuildSystemException("Can't process makefile: '{}', line: {}, crosstools 'sysroot' directory is not given.".format(config_proto, pragma_line))
+
+        xtools_arch_list = []
+        if xtools_arch:
+            xtools_arch_list, xtools_api_levels = parse_arch_specific_tokens(xtools_arch, arch_supported=[TAG_ARCH_X86_64], allow_empty_tokens=True)
+            if not xtools_arch_list:
+                raise BuildSystemException("Can't process makefile: '{}', line: {}, token 'arch' is malformed: '{}'".format(config_proto, pragma_line, xtools_arch))
+            if xtools_api_levels[TAG_ARCH_X86_64]:
+                xtools_arch_list = [ '{}:{}'.format(TAG_ARCH_X86_64, xtools_api_levels[TAG_ARCH_X86_64]) ]
+        if not xtools_arch_list:
+            xtools_arch_list = [ TAG_ARCH_X86_64 ]
+
+        xtools_parts += ["'package_path':'{}'".format(escape_string(xtools_package))]
+        if xtools_prefix:
+            xtools_parts += ["'prefix':'{}'".format(xtools_prefix)]
+        xtools_parts += ["'arch':['{}']".format(xtools_arch_list[0])]
+        if xtools_sysroot:
+            xtools_parts += ["'sysroot':'{}'".format(escape_string(xtools_sysroot))]
+        if xtools_version:
+            xtools_parts += ["'version':'{}'".format(xtools_version)]
+
+        toolset_id = 'macosx-xtools'
+        config_parts += ["'macosx-xtools':{{{}}}".format(','.join(xtools_parts))]
 
     else:
         toolset_id = '{}-native'.format(native_id)
@@ -1037,9 +1177,3 @@ def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs
 
 def _describe_clang_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs):
     return _describe_toolset_imp('clang', config_proto, pragma_line, sys_platform, sys_arch, **kwargs)
-
-
-def _create_clang_toolset(sysinfo, loader, **kwargs):
-    nasm_executable = kwargs.get('nasm_executable')
-    clang_tools = ToolsInfoGCC(is_clang=True, nasm=nasm_executable)
-    return ToolsetGCC('clang', clang_tools, sysinfo, loader)

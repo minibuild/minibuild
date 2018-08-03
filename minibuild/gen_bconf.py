@@ -84,6 +84,9 @@ def _generate_build_config_imp(config_proto, dest_config, sys_platform, sys_arch
             elif toolset_name == 'xtools':
                 toolset_subtype = 'xtools'
                 toolset_name = 'gcc'
+            elif toolset_name == 'macosx-xtools':
+                toolset_subtype = 'macosx-xtools'
+                toolset_name = 'clang'
             mod_toolset = imported_toolset_modules.get(toolset_name)
             if mod_toolset is None:
                 toolset_module_name = '{}.toolset_{}'.format(__package__, toolset_name)

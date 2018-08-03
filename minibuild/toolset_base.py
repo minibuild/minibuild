@@ -29,7 +29,7 @@ class ToolsetActionContext(object):
         self.verbose = verbose
         self.trace = trace
 
-    def subprocess_communicate(self, output, argv, issuer, env=None, output_filter=None, title=None):
+    def subprocess_communicate(self, output, argv, issuer, env=None, cwd=None, output_filter=None, title=None):
         ret = None
         if self.verbose:
             output.report_message("BUILDSYS: EXEC: {}".format(' '.join(argv)))
@@ -37,7 +37,7 @@ class ToolsetActionContext(object):
             output.report_message(' '.join(argv))
         if title is not None:
             output.report_message(title)
-        p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        p = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, cwd=cwd)
         stdout_data, _ = p.communicate()
         stdout_data = stdout_data.rstrip('\r\n').strip()
         if output_filter is not None:
