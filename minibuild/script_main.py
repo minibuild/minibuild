@@ -350,12 +350,6 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
         public_dir     = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_PUBLIC_DIR))
         faccess_dir    = os.path.normpath(os.path.join(output_dname, BUILD_CONFIG_DEFAULT_FACCESS_DIR))
 
-        mkdir_safe(bootstrap_dir)
-        mkdir_safe(obj_dir)
-        mkdir_safe(exe_dir)
-        mkdir_safe(static_lib_dir)
-        mkdir_safe(shared_lib_dir)
-
         sysinfo = {
             TAG_CFG_FROZEN: frozen,
             TAG_CFG_DIR_PROJECT_ROOT: project_root,
@@ -377,6 +371,7 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
 
         if conf_mk:
             config_file = os.path.normpath(os.path.join(bootstrap_dir, '{}-{}'.format(sys_platform, BUILD_SYSTEM_CONFIG_FILE)))
+            mkdir_safe(bootstrap_dir)
             generate_build_config(conf_mk, config_file, sys_platform, sys_arch, verbose)
         else:
             config_file = os.path.normpath(os.path.join(project_root, BUILD_SYSTEM_CONFIG_FILE))
@@ -509,7 +504,6 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
                 if not faccess_dirname_norm_prefix.startswith(sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX]):
                     raise BuildSystemException("Directory requested for faccess track '{}' (resolved as '{}') is out of <project-root> source tree.".format(faccess_dir_arg, faccess_dirname_abs))
                 faccess_prefixes.append(faccess_dirname_norm_prefix)
-        mkdir_safe(faccess_dir)
         if not faccess_prefixes:
             faccess_prefixes = [ sysinfo[TAG_CFG_PROJECT_ROOT_COMMON_PREFIX] ]
 

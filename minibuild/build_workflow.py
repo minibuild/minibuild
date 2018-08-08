@@ -720,19 +720,17 @@ class BuildWorkflow:
             model_lib_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_LIB], current_model.model_name, build_config)
             model_sharedlib_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_SHARED], current_model.model_name, build_config)
             model_exe_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_EXE], current_model.model_name, build_config)
-            mkdir_safe(model_lib_dir)
-            mkdir_safe(model_sharedlib_dir)
-            mkdir_safe(model_exe_dir)
-
             mod_action = None
 
             if description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_LIB_STATIC:
+                mkdir_safe(model_lib_dir)
                 mod_action = toolset.create_lib_static_link_action(description=description,
                     lib_directory=model_lib_dir,
                     obj_directory=mod_obj_dir,
                     obj_names=obj_names, build_model=current_model, build_config=build_config)
 
             elif description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_LIB_SHARED:
+                mkdir_safe(model_sharedlib_dir)
                 mod_action = toolset.create_lib_shared_link_action(description=description,
                     sharedlib_directory=model_sharedlib_dir,
                     lib_directory=model_lib_dir,
@@ -740,6 +738,7 @@ class BuildWorkflow:
                     obj_names=obj_names, build_model=current_model, build_config=build_config)
 
             elif description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_EXE:
+                mkdir_safe(model_exe_dir)
                 mod_action = toolset.create_exe_link_action(description=description,
                     sharedlib_directory=model_sharedlib_dir,
                     exe_directory=model_exe_dir,
