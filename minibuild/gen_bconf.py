@@ -12,7 +12,8 @@ from .pragma_tokens import load_buildconf_pragmas
 
 
 class _ToolsetPragmaConfig:
-    def __init__(self, toolset_name, pragma_line, pragma_options, subtype, model_aliases):
+    def __init__(self, label, toolset_name, pragma_line, pragma_options, subtype, model_aliases):
+        self.label = label
         self.toolset_name = toolset_name
         self.pragma_line = pragma_line
         self.pragma_options = pragma_options
@@ -76,7 +77,14 @@ def _generate_build_config_imp(config_proto, dest_config, sys_platform, sys_arch
         elif pragma.pragma_id == TAG_PRAGMA_TOOLSET:
             if TAG_PRAGMA_TOKEN_KEY_MODULE not in pragma.options or not pragma.options[TAG_PRAGMA_TOKEN_KEY_MODULE]:
                 raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, token: '{}' not given.".format(config_proto, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_MODULE))
-            toolset_name = pragma.options[TAG_PRAGMA_TOKEN_KEY_MODULE]
+            toolset_path = pragma.options[TAG_PRAGMA_TOKEN_KEY_MODULE]
+            toolset_label = None
+            if '/' in toolset_path:
+                toolset_name, toolset_label = toolset_path.split('/', 1)
+                if not toolset_label or '/' in toolset_label:
+                    raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, got malformed toolset label: '{}'.".format(config_proto, pragma.lineno, toolset_label))
+            else:
+                toolset_name = toolset_path
             toolset_subtype = None
             if toolset_name == 'mingw':
                 toolset_subtype = 'mingw'
@@ -105,7 +113,7 @@ def _generate_build_config_imp(config_proto, dest_config, sys_platform, sys_arch
                 if not aliases_arch_list:
                     raise BuildSystemException("Can't process makefile: '{}', instruction #pragma at line: {}, token '{}' is malformed: '{}'".format(config_proto, pragma.lineno, TAG_PRAGMA_TOKEN_KEY_ALIAS, model_aliases))
 
-            conf = _ToolsetPragmaConfig(toolset_name, pragma.lineno, pragma.options, toolset_subtype, toolset_model_aliases)
+            conf = _ToolsetPragmaConfig(toolset_label, toolset_name, pragma.lineno, pragma.options, toolset_subtype, toolset_model_aliases)
             toolset_init_requests.append(conf)
 
         elif pragma.pragma_id == TAG_PRAGMA_DEFAULT_MODELS:
@@ -139,7 +147,7 @@ def _generate_build_config_imp(config_proto, dest_config, sys_platform, sys_arch
             pragma_options = dict(conf.pragma_options)
         if nasm_executable:
             pragma_options['nasm_executable'] = nasm_executable
-        toolset_id, description_lines, conflicts, models_per_arch = mod_toolset.describe_toolset(config_proto, conf.pragma_line, sys_platform, sys_arch, **pragma_options)
+        toolset_id, description_lines, conflicts, models_per_arch = mod_toolset.describe_toolset(config_proto, conf.pragma_line, sys_platform, sys_arch, conf.label, **pragma_options)
         if toolset_id is None:
             skipped_toolset_count += 1
             continue

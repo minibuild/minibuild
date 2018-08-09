@@ -161,7 +161,7 @@ def auto_eval_native_model(used_model_name, toolset_models_mapping, required, ve
     return native_model_remap
 
 
-def eval_native_model_from_config(used_model_name, toolset_models_mapping, config, sys_platform, sys_arch, verbose):
+def eval_native_model_from_config(used_model_name, toolset_models_mapping, model_aliases, config, sys_platform, sys_arch, verbose):
     platform_ini_tag = '{}-{}'.format(sys_platform, sys_arch)
     native_model_remap = get_ini_conf_string0(config, TAG_INI_CONF_MAIN_NATIVE, platform_ini_tag)
     if not native_model_remap:
@@ -173,6 +173,8 @@ def eval_native_model_from_config(used_model_name, toolset_models_mapping, confi
             return None
         required = True if native_model_remap == TAG_NATIVE_MODELS_DETECTION_AUTO else False
         return auto_eval_native_model(used_model_name, toolset_models_mapping, required, verbose)
+    if native_model_remap in model_aliases:
+        native_model_remap = model_aliases[native_model_remap]
     if native_model_remap not in toolset_models_mapping:
         raise BuildSystemException(
             "Malformed project config file: got unknown model '{}' at '{}/{}'."
@@ -182,7 +184,7 @@ def eval_native_model_from_config(used_model_name, toolset_models_mapping, confi
     return native_model_remap
 
 
-def eval_native_model(used_model_name, toolset_models_mapping, config, sys_platform, sys_arch, verbose):
+def eval_native_model(used_model_name, toolset_models_mapping, model_aliases, config, sys_platform, sys_arch, verbose):
     eval_mode = get_ini_conf_string0(config, TAG_INI_CONF_MAIN, TAG_INI_NATIVE_MODELS_DETECTION_MODE)
     if eval_mode:
         if eval_mode not in TAG_NATIVE_MODELS_DETECTION_ALL_MODES:
@@ -198,7 +200,7 @@ def eval_native_model(used_model_name, toolset_models_mapping, config, sys_platf
         native_model_remap = None
 
     elif eval_mode == TAG_NATIVE_MODELS_DETECTION_CONFIG:
-        native_model_remap = eval_native_model_from_config(used_model_name, toolset_models_mapping, config, sys_platform, sys_arch, verbose)
+        native_model_remap = eval_native_model_from_config(used_model_name, toolset_models_mapping, model_aliases, config, sys_platform, sys_arch, verbose)
 
     else:
         native_model_required = True if eval_mode in [TAG_NATIVE_MODELS_DETECTION_AUTO, TAG_NATIVE_MODELS_DETECTION_CONFIG] else False
@@ -399,7 +401,14 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
                 toolset_init_args = eval(ast, {"__builtins__": None}, {})
             else:
                 toolset_init_args = {}
-            toolset_init_requests += [ (toolset_module_title, toolset_init_args) ]
+            toolset_serialized_custom_models = get_ini_conf_string0(config, toolset_section, TAG_INI_TOOLSET_MODELS)
+            if toolset_serialized_custom_models:
+                ast = compile(toolset_serialized_custom_models, '<toolset-models>', 'eval')
+                toolset_custom_models = eval(ast, {"__builtins__": None}, {})
+            else:
+                toolset_custom_models = None
+
+            toolset_init_requests += [ (toolset_module_title, toolset_custom_models, toolset_init_args) ]
 
         subst_info = {
             TAG_SUBST_PROJECT_ROOT: project_root,
@@ -408,7 +417,7 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
 
         toolset_models_mapping = {}
         imported_toolset_modules = {}
-        for toolset_module_title, toolset_init_args in toolset_init_requests:
+        for toolset_module_title, toolset_custom_models, toolset_init_args in toolset_init_requests:
             mod_toolset = imported_toolset_modules.get(toolset_module_title)
             if mod_toolset is None:
                 try:
@@ -419,7 +428,7 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
                     raise BuildSystemException("Malformed project config file: got unknown toolset module: '{}'.".format(toolset_module_title))
 
             desc_loader = BuildDescriptionLoader(sys_platform, sys_arch)
-            toolset = mod_toolset.create_toolset(sysinfo, desc_loader, **toolset_init_args)
+            toolset = mod_toolset.create_toolset(sysinfo, desc_loader, toolset_custom_models, **toolset_init_args)
             desc_loader.set_toolset_name(toolset.toolset_name)
             desc_loader.set_target_platform(toolset.platform_name)
             desc_loader.set_substitutions(subst_info)
@@ -551,7 +560,7 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
             print("BUILDSYS: Build model alias '{}' resolved as '{}'.".format(arg_model, primary_model))
         arg_model = primary_model
 
-    native_model_remap = eval_native_model(arg_model, toolset_models_mapping, config, sys_platform, sys_arch, verbose)
+    native_model_remap = eval_native_model(arg_model, toolset_models_mapping, model_aliases, config, sys_platform, sys_arch, verbose)
 
     parallelism = args.parallel
     if parallelism <= 0:

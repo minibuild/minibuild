@@ -42,6 +42,9 @@ MSVS_ASM64_TOOL = 'ml64.exe'
 MSVS_MODEL_FORMAT_WIN32 = 'msvs{}-win32'
 MSVS_MODEL_FORMAT_WIN64 = 'msvs{}-win64'
 
+MSVS_CUSTOM_MODEL_FORMAT_WIN32 = 'msvs-{}-win32'
+MSVS_CUSTOM_MODEL_FORMAT_WIN64 = 'msvs-{}-win64'
+
 MSVS_DEP_MARK = 'Note: including file:'
 MSVS_DEP_MARK_LEN = len(MSVS_DEP_MARK)
 
@@ -852,9 +855,9 @@ def _winapi_level_to_compiler_defines(api_level):
 
 
 class MsvsModelWin32(ToolsetModel):
-    def __init__(self, msvs_version, api_level):
+    def __init__(self, msvs_version, api_level, model_name):
         ToolsetModel.__init__(self)
-        self._name = MSVS_MODEL_FORMAT_WIN32.format(msvs_version)
+        self._name = model_name
         self._version = msvs_version
         self._is_native = is_windows_32bit()
         self._arch_defines = _winapi_level_to_compiler_defines(api_level)
@@ -894,9 +897,9 @@ class MsvsModelWin32(ToolsetModel):
 
 
 class MsvsModelWin64(ToolsetModel):
-    def __init__(self, msvs_version, api_level):
+    def __init__(self, msvs_version, api_level, model_name):
         ToolsetModel.__init__(self)
-        self._name = MSVS_MODEL_FORMAT_WIN64.format(msvs_version)
+        self._name = model_name
         self._version = msvs_version
         self._is_native = is_windows_64bit()
         self._arch_defines = _winapi_level_to_compiler_defines(api_level)
@@ -934,8 +937,10 @@ class MsvsModelWin64(ToolsetModel):
     def get_os_version(self):
         return self._os_version
 
+
 class ToolsetMSVS(ToolsetBase):
-    def __init__(self, msvs_version, sysinfo, loader, nasm_executable,
+    def __init__(self, msvs_version, sysinfo, loader,
+                nasm_executable, toolset_custom_models,
                 tools_path32, custom_env32, win32_api_level,
                 tools_path64, custom_env64, win64_api_level):
         ToolsetBase.__init__(self)
@@ -951,6 +956,22 @@ class ToolsetMSVS(ToolsetBase):
         self._custom_env64 = custom_env64
         self._win64_api_level = win64_api_level
 
+        if toolset_custom_models is None:
+            model_name_win32 = MSVS_MODEL_FORMAT_WIN32.format(msvs_version)
+            model_name_win64 = MSVS_MODEL_FORMAT_WIN64.format(msvs_version)
+        else:
+            model_name_win32 = toolset_custom_models[TAG_ARCH_X86]
+            model_name_win64 = toolset_custom_models[TAG_ARCH_X86_64]
+
+        model_win32 = MsvsModelWin32(self._msvs_version, self._win32_api_level, model_name_win32)
+        model_win64 = MsvsModelWin64(self._msvs_version, self._win64_api_level, model_name_win64)
+
+        models = {
+            model_win32.model_name : model_win32,
+            model_win64.model_name : model_win64,
+        }
+        self._models = models
+
     @property
     def toolset_name(self):
         return 'msvs'
@@ -961,13 +982,7 @@ class ToolsetMSVS(ToolsetBase):
 
     @property
     def supported_models(self):
-        model_win32 = MsvsModelWin32(self._msvs_version, self._win32_api_level)
-        model_win64 = MsvsModelWin64(self._msvs_version, self._win64_api_level)
-        models = {
-            model_win32.model_name : model_win32,
-            model_win64.model_name : model_win64,
-        }
-        return models
+        return self._models
 
     def _select_tool(self, tag, build_model):
         arch = build_model.architecture_abi_name
@@ -1036,7 +1051,8 @@ class ToolsetMSVS(ToolsetBase):
         return LinkActionMSVS(link_tool, mt_tool, rc_tool, env, self._sysinfo, self._loader, description, None, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config)
 
 
-def create_toolset(sysinfo, loader, **kwargs):
+def create_toolset(sysinfo, loader, toolset_custom_models, **kwargs):
+    # todo toolset_custom_models
     msvs_version = kwargs['msvs_version']
     bootstrap_dir = sysinfo[TAG_CFG_DIR_BOOTSTRAP]
     tools_path32, env_patch32, tools_path64, env_patch64 = init_msvs_toolset(msvs_version, bootstrap_dir)
@@ -1062,14 +1078,15 @@ def create_toolset(sysinfo, loader, **kwargs):
     if not win64_api_level:
         win64_api_level = WINDOWS_API_DEFAULT_LEVEL[TAG_ARCH_X86_64]
 
-    toolset = ToolsetMSVS(msvs_version=msvs_version, sysinfo=sysinfo, loader=loader, nasm_executable=nasm_executable,
+    toolset = ToolsetMSVS(msvs_version=msvs_version, sysinfo=sysinfo, loader=loader,
+        nasm_executable=nasm_executable, toolset_custom_models=toolset_custom_models,
         tools_path32=tools_path32, custom_env32=custom_env32, win32_api_level=win32_api_level,
         tools_path64=tools_path64, custom_env64=custom_env64, win64_api_level=win64_api_level)
 
     return toolset
 
 
-def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs):
+def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, toolset_label, **kwargs):
     version = kwargs.get('version')
     nasm_executable = kwargs.get('nasm_executable')
     arch = kwargs.get('arch')
@@ -1080,6 +1097,8 @@ def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs
     supported = []
     detected = 0
     if version == 'latest':
+        if not toolset_label:
+            toolset_label = 'latest'
         for probe_info in reversed(MSVS_VERSIONS_MAPPING):
             version_title = probe_info[0]
             probe_args = probe_info[1]
@@ -1128,19 +1147,35 @@ def describe_toolset(config_proto, pragma_line, sys_platform, sys_arch, **kwargs
     if not win64_api_level:
         win64_api_level = WINDOWS_API_DEFAULT_LEVEL[TAG_ARCH_X86_64]
 
-    toolset_id = 'msvs-{}'.format(msvs_version)
+    models_per_arch = {}
+    if toolset_label:
+        toolset_id = 'msvs/{}'.format(toolset_label)
+        models_per_arch[TAG_ARCH_X86] = MSVS_CUSTOM_MODEL_FORMAT_WIN32.format(toolset_label)
+        models_per_arch[TAG_ARCH_X86_64] = MSVS_CUSTOM_MODEL_FORMAT_WIN64.format(toolset_label)
+    else:
+        toolset_id = 'msvs-{}'.format(msvs_version)
+        models_per_arch[TAG_ARCH_X86] = MSVS_MODEL_FORMAT_WIN32.format(msvs_version)
+        models_per_arch[TAG_ARCH_X86_64] = MSVS_MODEL_FORMAT_WIN64.format(msvs_version)
+
+
     config_parts = ["'msvs_version':'{}'".format(msvs_version), "'winapi':{{'{}':'{}','{}':'{}'}}".format(TAG_ARCH_X86, win32_api_level, TAG_ARCH_X86_64, win64_api_level)]
     if nasm_executable:
         config_parts += ["'nasm_executable':'{0}'".format(escape_string(nasm_executable))]
     description_lines = [
         "[{}]".format(toolset_id),
         "{} = msvs".format(TAG_INI_TOOLSET_MODULE),
-        "{} = {{{}}}".format(TAG_INI_TOOLSET_CONFIG, ','.join(config_parts))
     ]
 
-    models_per_arch = {
-        TAG_ARCH_X86 : MSVS_MODEL_FORMAT_WIN32.format(msvs_version),
-        TAG_ARCH_X86_64 : MSVS_MODEL_FORMAT_WIN64.format(msvs_version),
-    }
+    if toolset_label:
+        custom_models_parts = []
+        for arch in sorted(models_per_arch):
+            custom_models_parts.append("'{}':'{}'".format(arch, models_per_arch[arch]))
+        description_lines += [
+            "{} = {{{}}}".format(TAG_INI_TOOLSET_MODELS, ','.join(custom_models_parts)),
+        ]
+
+    description_lines += [
+        "{} = {{{}}}".format(TAG_INI_TOOLSET_CONFIG, ','.join(config_parts))
+    ]
 
     return toolset_id, description_lines, None, models_per_arch
