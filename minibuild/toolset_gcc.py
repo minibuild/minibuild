@@ -270,8 +270,7 @@ class StaticLibLinkActionGCC(ToolsetActionBase):
         if not ctx.force:
             target_is_ready, _ = is_target_up_to_date(self.outlib_path, self.primary_deps, self.extra_deps, ctx.verbose)
         if target_is_ready:
-            if ctx.verbose:
-                output.report_message("BUILDSYS: up-to-date: '{}', lib: {}".format(self.module_name, self.outlib_path))
+            output.report_message("BUILDSYS: up-to-date: '{}', lib: {}".format(self.module_name, self.outlib_path))
             return ToolsetActionResult(rebuilt=False, artifacts=build_result)
 
         output.report_message("BUILDSYS: create LIB module '{}' ...".format(self.module_name))

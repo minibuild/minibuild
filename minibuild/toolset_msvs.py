@@ -60,6 +60,11 @@ TAG_MSVS_LINK = 'link'
 TAG_MSVS_ASM  = 'ml'
 TAG_MSVS_RC   = 'rc'
 
+MSVS_LINKER_ABI_FLAGS = {
+    TAG_ARCH_X86: ['/MACHINE:X86'],
+    TAG_ARCH_X86_64: ['/MACHINE:X64'],
+}
+
 
 def program_files_x86_path():
     is_on_win64 = is_windows_64bit()
@@ -603,17 +608,17 @@ class StaticLibLinkActionMSVS(ToolsetActionBase):
         self.env = env
         self.outlib_path = os.path.join(lib_directory, description.module_name + '.lib')
         self.module_name = description.module_name
+        self.obj_directory = obj_directory
         self.rsp_file = os.path.join(obj_directory, self.module_name + '.rsplnk')
-        self.obj_list = []
+        self.obj_fnames = []
         self.primary_deps = []
 
         for obj_name in obj_names:
-            obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
-            self.obj_list.append(obj_path)
-            self.primary_deps.append(obj_path)
+            obj_fname = obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX]
+            self.obj_fnames.append(obj_fname)
+            self.primary_deps.append(os.path.join(obj_directory, obj_fname))
 
-        self.extra_deps = []
-        self.extra_deps.extend(description.self_file_parts)
+        self.extra_deps = description.self_file_parts[:]
 
     def execute(self, output, ctx):
         build_result = [BuildArtifact(BUILD_RET_TYPE_LIB, self.outlib_path, BUILD_RET_ATTR_DEFAULT)]
@@ -625,9 +630,9 @@ class StaticLibLinkActionMSVS(ToolsetActionBase):
             return ToolsetActionResult(rebuilt=False, artifacts=build_result)
 
         output.report_message("BUILDSYS: create LIB module '{}' ...".format(self.module_name))
-        argv = [self.lib_tool, '/nologo', '/out:{}'.format(self.outlib_path)] + self.obj_list
+        argv = [self.lib_tool, '/nologo', '/out:{}'.format(self.outlib_path)] + self.obj_fnames
         argv = argv_to_rsp(argv, self.rsp_file)
-        ctx.subprocess_communicate(output, argv, issuer=self.outlib_path, env=self.env)
+        ctx.subprocess_communicate(output, argv, issuer=self.outlib_path, env=self.env, cwd=self.obj_directory)
         return ToolsetActionResult(rebuilt=True, artifacts=build_result)
 
 
@@ -654,6 +659,7 @@ class LinkActionMSVS(ToolsetActionBase):
         self.env = env
         self.sharedlib_directory = sharedlib_directory
         self.is_dll = True if exe_directory is None else False
+        self.obj_directory = obj_directory
         self.link_public_dir = sharedlib_directory if self.is_dll else exe_directory
         self.link_private_dir = os.path.join(obj_directory, 'raw')
         self.link_stamp_file = os.path.join(self.link_private_dir, 'link.stamp')
@@ -714,18 +720,19 @@ class LinkActionMSVS(ToolsetActionBase):
             self.manifest_stub = None
             self.manifest_builtin = None
         self.rsp_file = os.path.join(self.link_private_dir, self.module_name_private + '.rsplnk')
-        self.obj_list = []
+        self.obj_fnames = []
         self.build_config = build_config
         for obj_name in obj_names:
-            obj_path = os.path.join(obj_directory, obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX])
-            self.obj_list.append(obj_path)
-            self.primary_deps.append(obj_path)
+            obj_fname = obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX]
+            self.obj_fnames.append(obj_fname)
+            self.primary_deps.append(os.path.join(obj_directory, obj_fname))
+
         self.link_libstatic_names = []
         self.link_libshared_names = []
         eval_libnames_in_description(loader, description, build_model, self.link_libstatic_names, self.link_libshared_names)
         self.prebuilt_lib_names = eval_prebuilt_lib_list_in_description(description, build_model)
         self.linker_options = []
-        self.linker_options += build_model.get_linker_options()
+        self.linker_options += MSVS_LINKER_ABI_FLAGS[build_model.architecture_abi_name]
         os_version = build_model.get_os_version()
         if description.win_console:
             self.linker_options += ['/SUBSYSTEM:CONSOLE,{}'.format(os_version)]
@@ -780,8 +787,8 @@ class LinkActionMSVS(ToolsetActionBase):
         if self.res_file is not None:
             argv += [ self.res_file ]
 
-        if self.obj_list:
-            argv += self.obj_list
+        if self.obj_fnames:
+            argv += self.obj_fnames
         else:
             # LINK : warning LNK4001: no object files specified; libraries used
             argv += ['/IGNORE:4001']
@@ -815,7 +822,7 @@ class LinkActionMSVS(ToolsetActionBase):
                 argv += ['/STACK:{}'.format(self.win_stack_size)]
 
         argv = argv_to_rsp(argv, self.rsp_file)
-        ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private, env=self.env)
+        ctx.subprocess_communicate(output, argv, issuer=self.bin_path_private, env=self.env, cwd=self.obj_directory)
 
         if self.manifest_stub is not None:
             with open(self.manifest_stub, mode='wt') as fh_manifest:
@@ -854,53 +861,12 @@ def _winapi_level_to_compiler_defines(api_level):
     ]
 
 
-class MsvsModelWin32(ToolsetModel):
-    def __init__(self, msvs_version, api_level, model_name):
+class MsvsModel(ToolsetModel):
+    def __init__(self, msvs_version, arch, api_level, model_name):
         ToolsetModel.__init__(self)
         self._name = model_name
         self._version = msvs_version
-        self._is_native = is_windows_32bit()
-        self._arch_defines = _winapi_level_to_compiler_defines(api_level)
-        self._os_version = IMPLIED_WINDOWS_SUBSYSTEM_VALUES[api_level]
-
-    @property
-    def model_name(self):
-        return self._name
-
-    @property
-    def platform_name(self):
-        return TAG_PLATFORM_WINDOWS
-
-    @property
-    def platform_alias(self):
-        return None
-
-    @property
-    def architecture_abi_name(self):
-        return TAG_ARCH_X86
-
-    @property
-    def toolset_version(self):
-        return self._version
-
-    def is_native(self):
-        return self._is_native
-
-    def get_arch_defines(self):
-        return self._arch_defines
-
-    def get_linker_options(self):
-        return ['/MACHINE:X86']
-
-    def get_os_version(self):
-        return self._os_version
-
-
-class MsvsModelWin64(ToolsetModel):
-    def __init__(self, msvs_version, api_level, model_name):
-        ToolsetModel.__init__(self)
-        self._name = model_name
-        self._version = msvs_version
+        self._arch = arch
         self._is_native = is_windows_64bit()
         self._arch_defines = _winapi_level_to_compiler_defines(api_level)
         self._os_version = IMPLIED_WINDOWS_SUBSYSTEM_VALUES[api_level]
@@ -919,7 +885,7 @@ class MsvsModelWin64(ToolsetModel):
 
     @property
     def architecture_abi_name(self):
-        return TAG_ARCH_X86_64
+        return self._arch
 
     @property
     def toolset_version(self):
@@ -930,9 +896,6 @@ class MsvsModelWin64(ToolsetModel):
 
     def get_arch_defines(self):
         return self._arch_defines
-
-    def get_linker_options(self):
-        return ['/MACHINE:X64']
 
     def get_os_version(self):
         return self._os_version
@@ -963,8 +926,8 @@ class ToolsetMSVS(ToolsetBase):
             model_name_win32 = toolset_custom_models[TAG_ARCH_X86]
             model_name_win64 = toolset_custom_models[TAG_ARCH_X86_64]
 
-        model_win32 = MsvsModelWin32(self._msvs_version, self._win32_api_level, model_name_win32)
-        model_win64 = MsvsModelWin64(self._msvs_version, self._win64_api_level, model_name_win64)
+        model_win32 = MsvsModel(self._msvs_version, TAG_ARCH_X86, self._win32_api_level, model_name_win32)
+        model_win64 = MsvsModel(self._msvs_version, TAG_ARCH_X86_64, self._win64_api_level, model_name_win64)
 
         models = {
             model_win32.model_name : model_win32,
