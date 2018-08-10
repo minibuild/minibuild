@@ -443,7 +443,6 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
 
     except BuildSystemException as ex:
         buildsys_error = ex
-        pass
 
     if buildsys_error is None:
         models_help_prefix = '1) primary ' if model_aliases else ''

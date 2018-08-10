@@ -15,7 +15,7 @@ from .build_art import BuildArtifact
 from .constants import *
 from .depends_check import *
 from .error_utils import BuildSystemException, BuildSystemSysExit
-from .os_utils import cleanup_dir, mkdir_safe, normalize_path_optional, load_py_object
+from .os_utils import cleanup_dir, mkdir_safe, normalize_path_optional, load_py_object, touch_file
 from .spec_file import parse_spec_file
 from .string_utils import is_string_instance
 from .toolset_base import ToolsetActionContext
@@ -393,8 +393,7 @@ class BuildWorkflow:
             if self._verbose:
                 print("BUILDSYS: FACCESS: {}".format(faccess_relpath))
             mkdir_safe(os.path.dirname(faccess_stamp_file))
-            with open(faccess_stamp_file, 'wb'):
-                pass
+            touch_file(faccess_stamp_file)
 
     def _follow_faccess_in_spec_file(self, catalog):
         for source, _ in catalog:
@@ -492,8 +491,7 @@ class BuildWorkflow:
                     json.dump(spec_data, spec_fh, sort_keys=True, indent=4, ensure_ascii=False)
                 if description.spec_post_build:
                     self._perform_spec_post_build(description, used_model_name, build_config, rebuild_level)
-                with open(spec_fname_stamp, mode='w'):
-                    pass
+                touch_file(spec_fname_stamp)
                 if self._faccess:
                     self._follow_faccess_in_spec_file(mod_spec_catalog)
 
@@ -807,8 +805,7 @@ class BuildWorkflow:
                     if self._verbose:
                         print("BUILDSYS: FACCESS: {}".format(faccess_relpath))
                     mkdir_safe(os.path.dirname(faccess_stamp_file))
-                    with open(faccess_stamp_file, 'wb'):
-                        pass
+                    touch_file(faccess_stamp_file)
 
         if mod_build_result[0]:
             if description.post_build:
@@ -858,8 +855,7 @@ class BuildWorkflow:
                     dep_dir = normalize_path_optional(dep_ref, ext_description.self_dirname)
                     dep_desc = native_loader.load_build_description(dep_dir, native_model, required_by=ext_description.self_file_parts[0])
                     self._perform_build(dep_desc, self._native_model_remap, build_config, submod_rebuild_level)
-                with open(stamp_path, mode='w'):
-                    pass
+                touch_file(stamp_path)
 
         local_vars = {}
         if ext_description.ext_obj_dir_native_as_var is not None:
@@ -931,8 +927,7 @@ class BuildWorkflow:
         else:
             mod_obj_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, used_model_name, build_config)
         mod_post_build_stamp_file = os.path.join(mod_obj_dir, POST_BUILD_OBJ_STAMP_FILE)
-        with open(mod_post_build_stamp_file, mode='w'):
-            pass
+        touch_file(mod_post_build_stamp_file)
 
     def _perform_spec_post_build(self, description, used_model_name, build_config, rebuild_level):
         for ext_name in description.spec_post_build:

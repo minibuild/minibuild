@@ -33,6 +33,11 @@ def cleanup_dir(dir_name):
         mkdir_safe(dir_name)
 
 
+def touch_file(fname):
+    with open(fname, 'ab'):
+        pass
+
+
 def normalize_path_optional(path, not_abs_dir_prefix):
     if not os.path.isabs(path):
         path = os.path.join(not_abs_dir_prefix, path)

@@ -344,8 +344,7 @@ def init_msvs_toolset(msvs_version, bootstrap_dir):
             mkdir_safe(cache_dir)
             with open(sdk_path_file, mode='wt') as sdk_file:
                 sdk_file.writelines(['"', escape_string(sdk_path), '"'])
-            with open(stamp_file_sdk, mode='w') as _:
-                pass
+            touch_file(stamp_file_sdk)
     else:
         if os.path.exists(sdk_path_file):
             sdk_path = load_py_object(sdk_path_file)
@@ -430,8 +429,7 @@ def init_msvs_toolset(msvs_version, bootstrap_dir):
                     env_file.writelines(['"', escape_string(var_value), '"', ',\n'])
             env_file.writelines(['}\n'])
 
-    with open(stamp_file, mode='w') as _:
-        pass
+    touch_file(stamp_file)
     cl_path32 = load_py_object(cl_path_file32)
     env_patch32 = load_py_object(env_patch_file32)
     cl_path64 = load_py_object(cl_path_file64)
@@ -760,8 +758,7 @@ class LinkActionMSVS(ToolsetActionBase):
                 os.remove(built_item_info.path)
         cleanup_dir(self.link_private_dir)
         link_stamp_file_tmp = self.link_stamp_file + '.tmp'
-        with open(link_stamp_file_tmp, mode='wb'):
-            pass
+        touch_file(link_stamp_file_tmp)
 
         if self.winrc_file is not None:
             argv = [self.rc_tool, '/r', '/fo{}'.format(self.res_file)]

@@ -399,8 +399,7 @@ class LinkActionGCC(ToolsetActionBase):
                 os.remove(built_item_info.path)
         cleanup_dir(self.link_private_dir)
         link_stamp_file_tmp = self.link_stamp_file + '.tmp'
-        with open(link_stamp_file_tmp, mode='wb'):
-            pass
+        touch_file(link_stamp_file_tmp)
 
         if self.tools.is_mingw:
             if self.winrc_file is not None:

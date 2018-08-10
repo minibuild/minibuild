@@ -8,6 +8,7 @@ from .arch_parse import parse_arch_specific_tokens
 from .constants import *
 from .depends_check import prerequisite_newer_then_target
 from .error_utils import BuildSystemException
+from .os_utils import touch_file
 from .pragma_tokens import load_buildconf_pragmas
 
 
@@ -220,5 +221,4 @@ def generate_build_config(config_proto, config_file, sys_platform, sys_arch, ver
         if not prerequisite_newer_then_target(mt_target, mt_proto, gen_stamp_file, config_proto, verbose):
             return
     _generate_build_config_imp(config_proto, config_file, sys_platform, sys_arch, verbose)
-    with open(gen_stamp_file, 'wb'):
-        pass
+    touch_file(gen_stamp_file)
