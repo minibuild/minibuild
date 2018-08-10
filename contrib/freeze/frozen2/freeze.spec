@@ -1,6 +1,6 @@
 [
     {
-        'dirname': '../../minibuild',
+        'dirname': '../../../minibuild',
         'prefix': 'minibuild',
         'exclude-file': {
             'if-not-arcname-endswith': ['.py']

@@ -30,11 +30,9 @@ if os.path.isdir(os.path.join(BUILDSYS_PROJECT_ROOT_DIRNAME, 'cpython2/config'))
       '${@project_root}/cpython2/config',
     ]
 
-
 include_dir_list += [
   '${@project_root}/cpython2/vendor/Include',
 ]
-
 
 if os.path.isdir(os.path.join(BUILDSYS_PROJECT_ROOT_DIRNAME, 'pyffi')):
     lib_list += ['${@project_root}/pyffi']
@@ -64,10 +62,10 @@ lib_list += [
   '${@project_root}/bzip2',
 ]
 
-explicit_depends = ['resource']
+explicit_depends = ['../resource']
 zip_section = '${@project_output}/obj/minibuild_zrc/noarch/zsection.zip'
 
 definitions_windows = ['Py_NO_ENABLE_SHARED']
 prebuilt_lib_list_windows = ['advapi32', 'user32', 'shell32', 'ole32', 'oleaut32', 'crypt32', 'ws2_32']
 prebuilt_lib_list_linux = ['dl', 'pthread', 'util', 'nsl']
-macosx_framework_list = ['CoreFoundation', 'SystemConfiguration']
+macosx_framework_list = ['CoreFoundation', 'SystemConfiguration', 'Security']
