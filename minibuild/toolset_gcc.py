@@ -20,6 +20,7 @@ from .os_utils import *
 from .string_utils import escape_string, argv_to_rsp
 from .toolset_base import ToolsetBase, ToolsetModel, ToolsetActionBase, ToolsetActionResult
 from .osxapi_level import *
+from .ssp_stub import SSP_STUB_SOURCE
 from .winapi_level import *
 from .winrc_manifest import WINRC_MANIFEST
 
@@ -210,7 +211,7 @@ class SourceBuildActionGCC(ToolsetActionBase):
             raise BuildSystemException("Unsupported build type is given for file: '{}'".format(self.source_path))
 
         if not self.tools.is_mingw:
-            argv += ['-fpic', '-fstack-protector']
+            argv += ['-fpic', '-fstack-protector-strong']
         if not self.symbol_visibility_default:
             argv += ['-fvisibility=hidden']
         argv += ['-Wall', '-MD', '-MF', self.deptmp_path]
@@ -304,6 +305,13 @@ class LinkActionGCC(ToolsetActionBase):
         self.zip_section = None
         self.macosx_framework_list = []
         self.macosx_install_name_options = None
+        self.ssp_stub_fname_src = 'ssp_stub.c'
+        self.ssp_stub_fname_obj = 'ssp_stub' + sysinfo[TAG_CFG_OBJ_SUFFIX]
+
+        self.with_default_ssp = False
+        if not self.tools.is_mingw and not self.tools.is_clang:
+            if description.with_default_ssp:
+                self.with_default_ssp = True
 
         if build_model.platform_name == TAG_PLATFORM_MACOSX:
             self.macosx_framework_list = description.macosx_framework_list
@@ -367,13 +375,21 @@ class LinkActionGCC(ToolsetActionBase):
 
         self.rsp_file = os.path.join(self.link_private_dir, self.module_name_private + '.rsplnk')
         self.obj_fnames = []
-        self.arch_flags = []
-        self.arch_flags += build_model.get_arch_link_flags(description)
+        self.arch_compile_flags = []
+        self.arch_compile_flags += build_model.get_arch_compile_flags()
+        self.arch_link_flags = []
+        self.arch_link_flags += build_model.get_arch_link_flags(description)
         self.build_config = build_config
+
         for obj_name in obj_names:
             obj_fname = obj_name + sysinfo[TAG_CFG_OBJ_SUFFIX]
             self.obj_fnames.append(obj_fname)
             self.primary_deps.append(os.path.join(obj_directory, obj_fname))
+        if self.with_default_ssp:
+            ssp_stub_fpath_obj = os.path.join(self.link_private_dir, self.ssp_stub_fname_obj)
+            self.primary_deps.append(ssp_stub_fpath_obj)
+            self.obj_fnames.append(ssp_stub_fpath_obj)
+
         self.link_libstatic_names = []
         self.link_libshared_names = []
         eval_libnames_in_description(loader, description, build_model, self.link_libstatic_names, self.link_libshared_names)
@@ -428,8 +444,18 @@ class LinkActionGCC(ToolsetActionBase):
                 argv += [manifest_rc, self.manifest_res_file]
                 ctx.subprocess_communicate(output, argv, issuer=manifest_rc, title=os.path.basename(manifest_rc), env=self.tools.env)
 
+        if self.with_default_ssp:
+            with open(os.path.join(self.link_private_dir, self.ssp_stub_fname_src), mode='wt') as fh_ssp:
+                fh_ssp.writelines([SSP_STUB_SOURCE])
+            argv = [ self.tools.gpp ]
+            argv += self.arch_link_flags
+            if self.tools.sysroot:
+                argv += ['-isysroot', self.tools.sysroot]
+            argv += ['-x', 'c', '-fpic', '-fstack-protector-strong', '-fvisibility=hidden', '-Wall', '-O3', '-c', '-o', self.ssp_stub_fname_obj, self.ssp_stub_fname_src]
+            ctx.subprocess_communicate(output, argv, issuer=self.ssp_stub_fname_src, title=self.ssp_stub_fname_src, env=self.tools.env, cwd=self.link_private_dir)
+
         argv = [ self.tools.gpp ]
-        argv += self.arch_flags
+        argv += self.arch_link_flags
 
         if self.tools.is_mingw:
             argv += ['-Wl,--enable-stdcall-fixup']

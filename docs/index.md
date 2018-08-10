@@ -65,6 +65,11 @@ Some other _grammar tokens_ are **platform extendable**. So if for example gramm
   _list of strings_, Windows specific, effective when _module_type_ is _'executable'_ or _'lib-shared'_  
   The list of extra definitions to be used during compilation of a resource-definition script (.rc file) specified by option `winrc_file`.  
   
+* **with_default_ssp**
+  _boolean (integer)_, Linux specific, effective when _module_type_ is _'executable'_ or _'lib-shared'_  
+  When set to _True_, target binary is built with SSP (Stack Smashing Protector) stubs predefined in _MiniBuild_ build system, it helps to avoid explicit link with `libssp` for certain toolchains.  
+  When this grammar token is not given, its default value: `with_default_ssp = 1`
+  
 * **nasm**
   _boolean (integer)_, _i686_, _x86_64_ specific  
   This option has to be set to _True_, when your assembler sources are written in [NASM](https://www.nasm.us) assembler language, rather then in toolchain default assembler dialect (which is usually MASM or GAS depending on toolchain being used for build).
