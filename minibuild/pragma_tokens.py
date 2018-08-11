@@ -1,3 +1,4 @@
+import os.path
 import shlex
 import sys
 import re
@@ -128,6 +129,9 @@ def load_buildconf_pragmas(fname, sys_platform):
                 if '=' not in arg:
                     raise BuildSystemException("Can't load makefile: '{}', instruction #pragma at line: {}, malformed token: '{}'.".format(fname, idx, arg))
                 k, v = arg.split('=', 1)
+                if v.startswith('@/'):
+                    v = v[1:].lstrip('/').lstrip('\\')
+                    v = os.path.normpath(os.path.join(os.path.dirname(fname), v))
                 pragma_options[k] = v
             result.append(PragmaToken(pragma_id=pragma_id, lineno=idx, os_name=pragma_os, options=pragma_options))
     return result
