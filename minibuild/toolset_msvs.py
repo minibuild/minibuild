@@ -1011,8 +1011,7 @@ class ToolsetMSVS(ToolsetBase):
         return LinkActionMSVS(link_tool, mt_tool, rc_tool, env, self._sysinfo, self._loader, description, None, sharedlib_directory, lib_directory, obj_directory, obj_names, build_model, build_config)
 
 
-def create_toolset(sysinfo, loader, toolset_custom_models, **kwargs):
-    # todo toolset_custom_models
+def create_toolset(sysinfo, loader, sys_platform, sys_arch, toolset_custom_models, **kwargs):
     msvs_version = kwargs['msvs_version']
     bootstrap_dir = sysinfo[TAG_CFG_DIR_BOOTSTRAP]
     tools_path32, env_patch32, tools_path64, env_patch64 = init_msvs_toolset(msvs_version, bootstrap_dir)

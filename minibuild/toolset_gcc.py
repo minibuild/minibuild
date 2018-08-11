@@ -803,10 +803,21 @@ class ToolsetGCC(ToolsetBase):
                     self._platform_name = TAG_PLATFORM_MACOSX
                     model_name_native = CLANG_MODEL_MACOSX_X86_64 if toolset_custom_models is None else toolset_custom_models[TAG_ARCH_X86_64]
 
+                    osxapi_level_x86_64 = self._tools.api_levels[TAG_ARCH_X86_64]
+                    osx_arch_flags = []
+                    osx_arch_link_flags = []
+                    if osxapi_level_x86_64:
+                        osx_arch_flags += [
+                            '-mmacosx-version-min=' + osxapi_level_x86_64,
+                        ]
+                        osx_arch_link_flags += [
+                            '-mmacosx-version-min=' + osxapi_level_x86_64,
+                        ]
+
                     model_macosx_x86_64 = GccModel(
                         model_name=model_name_native, toolset_version=toolset_version, is_native=True,
                         target_os=TAG_PLATFORM_MACOSX, target_os_alias=TAG_PLATFORM_ALIAS_POSIX, arch_name=TAG_ARCH_X86_64,
-                        arch_flags=[], arch_link_flags=[])
+                        arch_flags=osx_arch_flags, arch_link_flags=osx_arch_link_flags)
 
                     models.append(model_macosx_x86_64)
 
@@ -1029,7 +1040,7 @@ def init_cross_tools(crosstools_title, sysinfo, toolset_name, target_platform, x
     return tools
 
 
-def _create_clang_toolset(sysinfo, loader, toolset_custom_models, **kwargs):
+def _create_clang_toolset(sysinfo, loader, sys_platform, sys_arch, toolset_custom_models, **kwargs):
     nasm_executable = kwargs.get('nasm_executable')
     if 'macosx-xtools' in kwargs:
         xtools_cfg = kwargs['macosx-xtools']
@@ -1037,11 +1048,26 @@ def _create_clang_toolset(sysinfo, loader, toolset_custom_models, **kwargs):
                                      arch_list_enabled=[TAG_ARCH_X86_64], api_levels_enabled=None)
         return ToolsetGCC('clang', cross_tools, sysinfo, loader, toolset_custom_models)
 
-    clang_tools = ToolsInfoGCC(is_clang=True, nasm=nasm_executable)
+    arch_list = kwargs.get('arch')
+    api_levels = {}
+    if arch_list:
+        for arch in arch_list:
+            api_level = None
+            if ':' in arch:
+                arch_value, api_level = arch.split(':', 1)
+                api_level = api_level.strip()
+            else:
+                arch_value = arch
+            if arch_value not in TAG_ALL_KNOWN_ARCH_LIST:
+                raise BuildSystemException("Malformed clang config: unknown arch value '{}' is given. Only the following values are supported: {}.".format(arch_value, ', '.join(TAG_ALL_KNOWN_ARCH_LIST)))
+            if api_level:
+                api_levels[arch_value] = api_level
+    api_level_sys = {sys_arch: api_levels.get(sys_arch)}
+    clang_tools = ToolsInfoGCC(is_clang=True, nasm=nasm_executable, api_levels=api_level_sys)
     return ToolsetGCC('clang', clang_tools, sysinfo, loader, toolset_custom_models)
 
 
-def create_toolset(sysinfo, loader, toolset_custom_models, **kwargs):
+def create_toolset(sysinfo, loader, sys_platform, sys_arch, toolset_custom_models, **kwargs):
     nasm_executable = kwargs.get('nasm_executable')
     if 'mingw' in kwargs:
         mingw = kwargs['mingw']
@@ -1226,7 +1252,11 @@ def _describe_toolset_imp(native_id, config_proto, pragma_line, sys_platform, sy
             models_per_arch[TAG_ARCH_X86_64] = CLANG_CROSSTOOL_MODEL_MACOSX_X86_64
 
     else:
-        toolset_id = '{}-native'.format(native_id)
+        if toolset_label:
+            toolset_id = native_id
+        else:
+            toolset_id = '{}-native'.format(native_id)
+
         if sys_platform == TAG_PLATFORM_LINUX:
             if native_id == 'gcc':
                 models_per_arch[sys_arch] = LINUX_GCC_MODEL_NAMES[sys_arch]
@@ -1235,7 +1265,18 @@ def _describe_toolset_imp(native_id, config_proto, pragma_line, sys_platform, sy
 
         elif sys_platform == TAG_PLATFORM_MACOSX:
             if native_id == 'clang' and sys_arch == TAG_ARCH_X86_64:
-                models_per_arch[TAG_ARCH_X86_64] = CLANG_MODEL_MACOSX_X86_64
+                if toolset_label:
+                    models_per_arch[TAG_ARCH_X86_64] = CLANG_CROSSTOOL_CUSTOM_MODEL_FORMAT_MACOSX_X86_64.format(toolset_label)
+                else:
+                    models_per_arch[TAG_ARCH_X86_64] = CLANG_MODEL_MACOSX_X86_64
+                osx_arch = kwargs.get('arch')
+                if osx_arch:
+                    osx_arch_list, osx_api_levels = parse_arch_specific_tokens(osx_arch, arch_supported=[TAG_ARCH_X86_64], allow_empty_tokens=True)
+                    if not osx_arch_list:
+                        raise BuildSystemException("Can't process makefile: '{}', line: {}, token 'arch' is malformed: '{}'".format(config_proto, pragma_line, osx_arch))
+                    if osx_api_levels[TAG_ARCH_X86_64]:
+                        osx_arch_list = [ '{}:{}'.format(TAG_ARCH_X86_64, osx_api_levels[TAG_ARCH_X86_64]) ]
+                        config_parts += ["'arch':['{}']".format(osx_arch_list[0])]
 
     if nasm_executable:
         config_parts += ["'nasm_executable':'{0}'".format(escape_string(nasm_executable))]

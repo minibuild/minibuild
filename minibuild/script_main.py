@@ -428,7 +428,7 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
                     raise BuildSystemException("Malformed project config file: got unknown toolset module: '{}'.".format(toolset_module_title))
 
             desc_loader = BuildDescriptionLoader(sys_platform, sys_arch)
-            toolset = mod_toolset.create_toolset(sysinfo, desc_loader, toolset_custom_models, **toolset_init_args)
+            toolset = mod_toolset.create_toolset(sysinfo, desc_loader, sys_platform, sys_arch, toolset_custom_models, **toolset_init_args)
             desc_loader.set_toolset_name(toolset.toolset_name)
             desc_loader.set_target_platform(toolset.platform_name)
             desc_loader.set_substitutions(subst_info)
