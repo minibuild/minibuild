@@ -65,6 +65,11 @@ Some other _grammar tokens_ are **platform extendable**. So if for example gramm
   _list of strings_, Windows specific, effective when _module_type_ is _'executable'_ or _'lib-shared'_  
   The list of extra definitions to be used during compilation of a resource-definition script (.rc file) specified by option `winrc_file`.  
   
+*  **with_comdat_folding**
+  _boolean (integer)_,  Visual Studio toolchain specific, effective when _module_type_ is _'executable'_ or _'lib-shared'_  
+  When this grammar token is not given, its default value is `False` for debug configuration and `True` otherwise.  
+  When this option is set to `True`, linker from Visual Studio toolchain is invoked with `/OPT:REF,ICF=2` command line flags, and with `/OPT:NOREF,NOICF` otherwise.  
+
 * **with_default_ssp**
   _boolean (integer)_, Linux specific, effective when _module_type_ is _'executable'_ or _'lib-shared'_  
   When set to _True_, target binary is built with SSP (Stack Smashing Protector) stubs predefined in _MiniBuild_ build system, it helps to avoid explicit link with `libssp` for certain toolchains.  

@@ -668,6 +668,13 @@ class LinkActionMSVS(ToolsetActionBase):
         self.use_wmain = description.wmain
         self.win_stack_size = description.win_stack_size
         self.zip_section = None
+        if description.with_comdat_folding is None:
+            if build_config == BUILD_CONFIG_DEBUG:
+                self.with_comdat_folding = False
+            else:
+                self.with_comdat_folding = True
+        else:
+            self.with_comdat_folding = description.with_comdat_folding
 
         if description.zip_section is not None:
             zip_section_file = normalize_path_optional(description.zip_section, description.self_dirname)
@@ -769,17 +776,15 @@ class LinkActionMSVS(ToolsetActionBase):
             argv += [self.winrc_file]
             ctx.subprocess_communicate(output, argv, issuer=self.winrc_file, env=self.env, output_filter=rc_tool_output_filter, title=os.path.basename(self.winrc_file))
 
-        argv = [self.linker, '/nologo', '/incremental:no']
-        argv += ['/debug', '/pdb:{}'.format(self.pdb_path_private)]
+        argv = [self.linker, '/NOLOGO', '/INCREMENTAL:NO']
+        argv += ['/DEBUG', '/PDB:{}'.format(self.pdb_path_private)]
 
-        if self.build_config == BUILD_CONFIG_RELEASE:
+        if self.with_comdat_folding:
             argv += ['/OPT:REF,ICF=2']
-        elif self.build_config == BUILD_CONFIG_DEBUG:
-            argv += ['/OPT:NOREF,NOICF']
         else:
-            raise BuildSystemException("Unsupported build config: '{}'".format(self.build_config))
+            argv += ['/OPT:NOREF,NOICF']
 
-        argv += [ '-out:{}'.format(self.bin_path_private)]
+        argv += [ '/OUT:{}'.format(self.bin_path_private)]
 
         if self.res_file is not None:
             argv += [ self.res_file ]
@@ -791,12 +796,12 @@ class LinkActionMSVS(ToolsetActionBase):
             argv += ['/IGNORE:4001']
 
         if self.link_libstatic_names:
-            argv += ['/libpath:{}'.format(self.lib_directory) ]
+            argv += ['/LIBPATH:{}'.format(self.lib_directory) ]
             for libname in self.link_libstatic_names:
                 argv += ['{}.lib'.format(libname) ]
 
         if self.link_libshared_names:
-            argv += ['/libpath:{}'.format(self.sharedlib_directory) ]
+            argv += ['/LIBPATH:{}'.format(self.sharedlib_directory) ]
             for libname in self.link_libshared_names:
                 argv += ['{}.lib'.format(libname) ]
 
@@ -806,9 +811,9 @@ class LinkActionMSVS(ToolsetActionBase):
         argv += self.linker_options
 
         if self.is_dll:
-            argv += ['/dll', '/implib:{}'.format(self.implib_path_private) ]
+            argv += ['/DLL', '/IMPLIB:{}'.format(self.implib_path_private) ]
             if self.exports_def_file is not None:
-                argv += ['/def:{}'.format(self.exports_def_file) ]
+                argv += ['/DEF:{}'.format(self.exports_def_file) ]
             if self.export_list:
                 for export_entry in self.export_list:
                     argv += ['/EXPORT:{}'.format(export_entry)]
