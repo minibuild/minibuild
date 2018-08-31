@@ -196,7 +196,8 @@ class SourceBuildActionGCC(ToolsetActionBase):
             elif self.source_type == BUILD_TYPE_ASM:
                 output.report_message("BUILDSYS: ASM: {}".format(self.source_path))
 
-        argv = [self.tools.gpp, '-Werror-implicit-function-declaration']
+        argv = [self.tools.gpp, '-Werror-implicit-function-declaration', '-ffunction-sections', '-fdata-sections', '-fno-omit-frame-pointer' ]
+
         argv += self.arch_flags
         if self.tools.sysroot:
             argv += ['-isysroot', self.tools.sysroot]
@@ -500,6 +501,13 @@ class LinkActionGCC(ToolsetActionBase):
             else:
                 if not self.tools.is_clang:
                     argv += ['-pie']
+
+        if self.tools.is_clang:
+            argv += ['-Wl,-dead_strip', '-Wl,-dead_strip_dylibs', '-Wl,-no_dead_strip_inits_and_terms' ]
+        else:
+            argv += ['-Wl,--gc-sections']
+            if self.tools.is_mingw:
+                argv += ['-Wl,-strip-all']
 
         if not self.tools.is_mingw and not self.tools.is_clang:
             argv += ['-Wl,-z,noexecstack']

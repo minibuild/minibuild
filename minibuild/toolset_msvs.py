@@ -539,7 +539,7 @@ class SourceBuildActionMSVS(ToolsetActionBase):
             else:
                 output.report_message("BUILDSYS: C: {}".format(self.source_path))
 
-        argv = [self.cl, '/c', '/nologo', '/showIncludes']
+        argv = [self.cl, '/c', '/nologo', '/showIncludes', '/Gy']
         if self.source_type == BUILD_TYPE_CPP:
             argv += ['/TP', '/EHsc', '/GR', '/Zc:forScope', '/Zc:wchar_t']
         elif self.source_type == BUILD_TYPE_C:
