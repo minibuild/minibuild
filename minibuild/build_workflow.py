@@ -399,7 +399,7 @@ class BuildWorkflow:
         for source, _ in catalog:
             self._follow_faccess_for_file(source)
 
-    def _build_zip_module(self, description, force):
+    def _build_zip_module(self, description, current_model, force):
         if not description.spec_file:
             raise BuildSystemException("Mandatory token '{}' is missed, required in '{}'.".format(TAG_GRAMMAR_KEY_SPEC_FILE, description.self_file_parts[0]))
         if not description.zip_file:
@@ -409,7 +409,7 @@ class BuildWorkflow:
         mkdir_safe(zip_obj_dir)
 
         spec_fname = normalize_path_optional(description.spec_file, description.self_dirname)
-        catalog = parse_spec_file(spec_fname, self._grammar_substitutions)
+        catalog = parse_spec_file(spec_fname, self._grammar_substitutions, current_model)
 
         zippath = os.path.join(zip_obj_dir, description.zip_file)
         if force:
@@ -474,7 +474,7 @@ class BuildWorkflow:
                 print("BUILDSYS: up-to-date: spec-file for module '{}'".format(description.module_name))
             else:
                 print("BUILDSYS: processing spec-file for module '{}'".format(description.module_name))
-                mod_spec_catalog = parse_spec_file(spec_fname_input, self._grammar_substitutions)
+                mod_spec_catalog = parse_spec_file(spec_fname_input, self._grammar_substitutions, current_model)
                 with open(spec_fname_output, 'wt') as spec_fh:
                     spec_data = {}
                     spec_data[TAG_GRAMMAR_KEY_SPEC_FILE] = []
@@ -497,7 +497,7 @@ class BuildWorkflow:
 
 
         if description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_ZIP_FILE:
-            mod_build_result = self._build_zip_module(description, rebuild_level > 0)
+            mod_build_result = self._build_zip_module(description, current_model, rebuild_level > 0)
 
         elif description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_DOWNLOAD:
             force_download = rebuild_level > 0
@@ -544,7 +544,7 @@ class BuildWorkflow:
                     if not os.path.isfile(file_ref):
                         raise BuildSystemException("File '{}' not found, required in '{}'".format(file_ref, description.self_file_parts[0]))
                     if target_properties.get(TAG_GRAMMAR_COMPOSITE_ITEM_IS_SPEC_FILE):
-                        composite_injection = parse_spec_file(file_ref, self._grammar_substitutions)
+                        composite_injection = parse_spec_file(file_ref, self._grammar_substitutions, current_model)
                         being_built, artifacts = False, []
                         for composite_injection_entry_path, composite_injection_arcname in composite_injection:
                             artifacts.append((BuildArtifact(BUILD_RET_TYPE_RESOURCE, composite_injection_entry_path, BUILD_RET_ATTR_DEFAULT), composite_injection_arcname))
