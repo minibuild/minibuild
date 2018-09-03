@@ -212,7 +212,11 @@ class SourceBuildActionGCC(ToolsetActionBase):
             raise BuildSystemException("Unsupported build type is given for file: '{}'".format(self.source_path))
 
         if not self.tools.is_mingw:
-            argv += ['-fpic', '-fstack-protector-strong']
+            argv += ['-fpic']
+            if self.tools.is_clang:
+                argv += ['-fstack-protector']
+            else:
+                argv += ['-fstack-protector-strong']
         if not self.symbol_visibility_default:
             argv += ['-fvisibility=hidden']
         argv += ['-Wall', '-MD', '-MF', self.deptmp_path]
@@ -452,7 +456,7 @@ class LinkActionGCC(ToolsetActionBase):
             argv += self.arch_link_flags
             if self.tools.sysroot:
                 argv += ['-isysroot', self.tools.sysroot]
-            argv += ['-x', 'c', '-fpic', '-fstack-protector-strong', '-fvisibility=hidden', '-Wall', '-O3', '-c', '-o', self.ssp_stub_fname_obj, self.ssp_stub_fname_src]
+            argv += ['-x', 'c', '-fpic', '-fvisibility=hidden', '-Wall', '-O3', '-c', '-o', self.ssp_stub_fname_obj, self.ssp_stub_fname_src]
             ctx.subprocess_communicate(output, argv, issuer=self.ssp_stub_fname_src, title=self.ssp_stub_fname_src, env=self.tools.env, cwd=self.link_private_dir)
 
         argv = [ self.tools.gpp ]
