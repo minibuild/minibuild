@@ -564,8 +564,13 @@ def create_build_workflow(frozen, build_directory, verbose, argv):
     parallelism = args.parallel
     if parallelism <= 0:
         parallelism = 1
+
+    if os.environ.get('MINIBUILD_TRACE'):
+        cmd_trace = True
+    else:
+        cmd_trace = args.trace
     logic = BuildWorkflow(sysinfo=sysinfo, toolset_models_mapping=toolset_models_mapping, native_model_remap=native_model_remap,
-        grammar_substitutions=subst_info, verbose=verbose, trace=args.trace, parallelism=parallelism, faccess=args.faccess, faccess_prefixes=faccess_prefixes)
+        grammar_substitutions=subst_info, verbose=verbose, trace=cmd_trace, parallelism=parallelism, faccess=args.faccess, faccess_prefixes=faccess_prefixes)
 
     for model_name in toolset_models_mapping:
         _, desc_loader = toolset_models_mapping[model_name]
@@ -637,7 +642,10 @@ def script_main_perform(argv_in, frozen, dir_redirect, walks, level, verbose=Non
 
     build_directory, _verbose, argv = preload_argv(argv, dir_redirect)
     if verbose is None:
-        verbose = _verbose
+        if os.environ.get('MINIBUILD_VERBOSE'):
+            verbose = True
+        else:
+            verbose = _verbose
     if verbose:
         print("BUILDSYS: CWD: {}".format(build_directory))
         print("BUILDSYS: RUN: {}".format(' '.join(argv)))
@@ -654,7 +662,7 @@ def script_main_perform(argv_in, frozen, dir_redirect, walks, level, verbose=Non
             script_main_perform(cmd, frozen, build_directory, walks, level+1, verbose)
 
 
-def script_main(argv=None, frozen=False):
+def script_main(argv=None):
     try:
         if argv is None:
             argv = sys.argv[1:]
@@ -662,6 +670,7 @@ def script_main(argv=None, frozen=False):
             print(format_version_string(frozen))
             return 0
         walks = set()
+        frozen = True if __file__ == '<frozen>' else False
         script_main_perform(argv, frozen, os.getcwd(), walks, 0)
         return 0
     except BuildSystemSysExit as exc:

@@ -1,4 +1,5 @@
 #include <Python.h>
+#include <stdlib.h>
 #include "minibuild_frozen.h"
 
 extern struct _frozen _PyImport_FrozenStdlibModules[];
@@ -44,7 +45,7 @@ static TableInfo BYTECODE_TABLES[] = {
     {NULL, 0}
 };
 
-size_t InitTablesSize()
+static size_t InitTablesSize()
 {
     size_t total = 0;
     size_t idx = 0;
@@ -62,7 +63,7 @@ size_t InitTablesSize()
     return total;
 }
 
-void MergeBytecodeTables(struct _frozen* dest)
+static void MergeBytecodeTables(struct _frozen* dest)
 {
     size_t idx = 0;
     TableInfo* table = NULL;
@@ -74,7 +75,7 @@ void MergeBytecodeTables(struct _frozen* dest)
     }
 }
 
-int frozen_main(int argc, char **argv)
+static int FrozenMain(int argc, char **argv)
 {
     char* p;
     int n, sts;
@@ -110,18 +111,57 @@ int main(int argc, char** argv)
     int sys_argc = 0;
     char** sys_argv = 0;
     int interpreter = 0;
+    int interpreter_args_start = 0;
+    int verbose = 0;
+    int trace = 0;
     size_t total = 0;
     int ret = 126;
+    int i;
     struct _frozen* frozen_modules = NULL;
-    if ((argc >= 2) && (strcmp(argv[1], "--interpreter") == 0))
+    for (i = 1; i < argc; ++i)
+    {
+        if (strcmp(argv[i], "--interpreter") == 0)
+        {
+            interpreter = 1;
+            interpreter_args_start = i + 1;
+            break;
+        }
+        else if (strcmp(argv[i], "--verbose") == 0)
+        {
+            verbose = 1;
+        }
+        else if (strcmp(argv[i], "--trace") == 0)
+        {
+            trace = 1;
+        }
+    }
+    if (interpreter)
     {
         interpreter = 1;
-        sys_argc = argc - 1;
+        sys_argc = argc + 1 - interpreter_args_start;
         sys_argv = (char**)malloc(argc * sizeof(char*));
         memset(sys_argv, 0, argc * sizeof(char*));
         sys_argv[0] = argv[0];
         if (sys_argc > 1)
-            memcpy(&sys_argv[1], &argv[2], (sys_argc - 1) * sizeof(char*));
+        {
+            memcpy(&sys_argv[1], &argv[interpreter_args_start], (sys_argc - 1) * sizeof(char*));
+        }
+        if (verbose)
+        {
+#ifdef _WIN32
+            putenv("MINIBUILD_VERBOSE=1");
+#else
+            setenv("MINIBUILD_VERBOSE", "1", 1);
+#endif
+        }
+        else if (trace)
+        {
+#ifdef _WIN32
+            putenv("MINIBUILD_TRACE=1");
+#else
+            setenv("MINIBUILD_TRACE", "1", 1);
+#endif
+        }
     }
     total = InitTablesSize();
     frozen_modules = (struct _frozen*)malloc(sizeof(struct _frozen) * (total + 1));
@@ -135,7 +175,7 @@ int main(int argc, char** argv)
     }
     else
     {
-        ret = frozen_main(argc, argv);
+        ret = FrozenMain(argc, argv);
     }
     free(frozen_modules);
     free(sys_argv);
