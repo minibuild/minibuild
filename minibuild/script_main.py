@@ -664,13 +664,13 @@ def script_main_perform(argv_in, frozen, dir_redirect, walks, level, verbose=Non
 
 def script_main(argv=None):
     try:
+        frozen = True if __file__ == '<frozen>' else False
         if argv is None:
             argv = sys.argv[1:]
         if len(argv) == 1 and argv[0] == '--version':
             print(format_version_string(frozen))
             return 0
         walks = set()
-        frozen = True if __file__ == '<frozen>' else False
         script_main_perform(argv, frozen, os.getcwd(), walks, 0)
         return 0
     except BuildSystemSysExit as exc:
