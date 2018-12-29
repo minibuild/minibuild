@@ -23,6 +23,7 @@ from .depends_check import *
 from .error_utils import BuildSystemException
 from .nasm_action import NasmSourceBuildAction
 from .os_utils import *
+from .parse_deffile import load_export_list_from_def_file
 from .string_utils import escape_string, argv_to_rsp
 from .toolset_base import ToolsetBase, ToolsetModel, ToolsetActionBase, ToolsetActionResult
 from .winapi_level import *
@@ -811,12 +812,26 @@ class LinkActionMSVS(ToolsetActionBase):
         argv += self.linker_options
 
         if self.is_dll:
+            actual_export_list = []
             argv += ['/DLL', '/IMPLIB:{}'.format(self.implib_path_private) ]
             if self.exports_def_file is not None:
                 argv += ['/DEF:{}'.format(self.exports_def_file) ]
+                export_list_from_def = load_export_list_from_def_file(self.exports_def_file, winapi_only=None, for_winapi=True)
+                actual_export_list.extend(export_list_from_def)
             if self.export_list:
                 for export_entry in self.export_list:
                     argv += ['/EXPORT:{}'.format(export_entry)]
+                    actual_export_list.append(export_entry)
+
+            with open(os.path.join(self.link_private_dir, 'symbols.json'), 'wt') as fh:
+                print("[", file=fh)
+                exp_idx = 0
+                for export_entry in sorted(actual_export_list):
+                    exp_idx += 1
+                    exp_tail = ',' if exp_idx < len(actual_export_list) else ''
+                    print('    "{}"{}'.format(export_entry, exp_tail), file=fh)
+                print("]", file=fh)
+
         else:
             if self.use_wmain:
                 argv += ['/ENTRY:wmainCRTStartup']
