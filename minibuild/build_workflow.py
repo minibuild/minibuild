@@ -455,6 +455,12 @@ class BuildWorkflow:
                 xpl_rebuild_level = 2 if rebuild_level == 2 else 0
                 self._perform_build(xpl_dep_desc, used_model_name, build_config, xpl_rebuild_level)
 
+        if description.pre_build_noarch:
+            self._perform_pre_build(description, used_model_name, build_config, rebuild_level, noarch=True)
+
+        if description.pre_build:
+            self._perform_pre_build(description, used_model_name, build_config, rebuild_level, noarch=False)
+
         if description.spec_file:
             noarch_obj_mod_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
             mkdir_safe(noarch_obj_mod_dir)
@@ -501,8 +507,12 @@ class BuildWorkflow:
 
         elif description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_DOWNLOAD:
             force_download = rebuild_level > 0
+            noarch_obj_mod_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
+            if description.pre_build or description.pre_build_noarch:
+                mod_download_pre_build_stamp_file = os.path.join(noarch_obj_mod_dir, PRE_BUILD_OBJ_STAMP_FILE)
+                if not os.path.isfile(mod_download_pre_build_stamp_file):
+                    force_download = True
             if description.post_build:
-                noarch_obj_mod_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
                 mod_download_post_build_stamp_file = os.path.join(noarch_obj_mod_dir, POST_BUILD_OBJ_STAMP_FILE)
                 if not os.path.isfile(mod_download_post_build_stamp_file):
                     force_download = True
@@ -510,6 +520,7 @@ class BuildWorkflow:
 
         elif description.module_type == TAG_GRAMMAR_VALUE_MODULE_TYPE_COMPOSITE:
             mod_composite_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, current_model.model_name, build_config)
+            mod_composite_dir_noarch = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
             mkdir_safe(mod_composite_dir)
             if not isinstance(description.composite_spec, list):
                 raise BuildSystemException("Spec of composite not a list, provided in: '{}'.".format(description.self_file_parts[0]))
@@ -611,6 +622,16 @@ class BuildWorkflow:
                     art_target_path = os.path.join(art_target_dir, art_target_fname)
                     composite_copy_files_info.append((art_build_path, art_target_path, art_build_attr))
                     composite_output_files.append(BuildArtifact(art_type, art_target_path, art_build_attr))
+
+            if description.pre_build_noarch:
+                mod_composite_pre_build_noarch_stamp_file = os.path.join(mod_composite_dir_noarch, PRE_BUILD_OBJ_STAMP_FILE)
+                if not os.path.exists(mod_composite_pre_build_noarch_stamp_file):
+                    composite_need_rebuild = True
+
+            if description.pre_build:
+                mod_composite_pre_build_stamp_file = os.path.join(mod_composite_dir, PRE_BUILD_OBJ_STAMP_FILE)
+                if not os.path.exists(mod_composite_pre_build_stamp_file):
+                    composite_need_rebuild = True
 
             if description.post_build:
                 mod_composite_post_build_stamp_file = os.path.join(mod_composite_dir, POST_BUILD_OBJ_STAMP_FILE)
@@ -837,7 +858,9 @@ class BuildWorkflow:
         native_toolset = None
         native_loader = None
         native_model = None
-        if ext_description.ext_native_depends is not None or ext_description.ext_obj_dir_native_as_var is not None:
+        if (ext_description.ext_native_depends is not None or
+                ext_description.ext_obj_dir_native_as_var is not None or
+                ext_description.ext_exe_path_native_as_var is not None):
             if self._native_model_remap is None:
                 raise BuildSystemException("Native model is not defined, required by '{}'.".format(ext_description.self_file_parts[0]))
             native_toolset, native_loader = self._toolset_models_mapping[self._native_model_remap]
@@ -865,6 +888,20 @@ class BuildWorkflow:
                 module_obj_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], module_desc.module_name, self._native_model_remap, build_config)
                 local_vars[local_var_name] = module_obj_dir
 
+        if ext_description.ext_exe_path_native_as_var is not None:
+            for local_var_name, module_ref in ext_description.ext_exe_path_native_as_var:
+                module_dir = normalize_path_optional(module_ref, ext_description.self_dirname)
+                module_desc = native_loader.load_build_description(module_dir, native_model, required_by=ext_description.self_file_parts[0])
+                if module_desc.module_type != TAG_GRAMMAR_VALUE_MODULE_TYPE_EXE:
+                    raise BuildSystemException("Module '{}' is not an executable, required by '{}'.".format(module_desc.module_name, ext_description.self_file_parts[0]))
+                module_exe_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_EXE], self._native_model_remap, build_config)
+                module_exe_name = module_desc.module_name
+                if module_desc.exe_name:
+                    module_exe_name = module_desc.exe_name
+                if sys.platform == 'win32':
+                   module_exe_name = module_exe_name + '.exe'
+                local_vars[local_var_name] = os.path.join(module_exe_dir, module_exe_name)
+
         subst_vars = {}
         if ext_description.ext_vars_required is not None:
             for subst_var_name in ext_description.ext_vars_required:
@@ -872,9 +909,11 @@ class BuildWorkflow:
                     subst_vars[TAG_GRAMMAR_VALUE_EXT_VAR_DIR_HERE] = ext_description.self_dirname
                 elif subst_var_name == TAG_GRAMMAR_VALUE_EXT_VAR_BUILDSYS_TARGET_OBJ_DIR:
                     mod_obj_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, used_model_name, build_config)
+                    mkdir_safe(mod_obj_dir)
                     subst_vars[TAG_GRAMMAR_VALUE_EXT_VAR_BUILDSYS_TARGET_OBJ_DIR] = mod_obj_dir
                 elif subst_var_name == TAG_GRAMMAR_VALUE_EXT_VAR_BUILDSYS_TARGET_OBJ_NOARCH_DIR:
                     mod_obj_noarch_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
+                    mkdir_safe(mod_obj_noarch_dir)
                     subst_vars[TAG_GRAMMAR_VALUE_EXT_VAR_BUILDSYS_TARGET_OBJ_NOARCH_DIR] = mod_obj_noarch_dir
                 elif subst_var_name == TAG_GRAMMAR_VALUE_EXT_VAR_BUILDSYS_TARGET_SRC_DIR:
                     subst_vars[TAG_GRAMMAR_VALUE_EXT_VAR_BUILDSYS_TARGET_SRC_DIR] = description.self_dirname
@@ -916,6 +955,29 @@ class BuildWorkflow:
                 cmdline_value, TAG_GRAMMAR_KEY_EXT_CALL_CMDLINE, ext_description.self_file_parts[0]))
         ext_action = ExtAction(ext_description.ext_type, ext_description.ext_name, description.module_name, self._verbose, argv)
         return ext_action
+
+    def _perform_pre_build(self, description, used_model_name, build_config, rebuild_level, noarch):
+        if noarch or description.module_type in (TAG_GRAMMAR_VALUE_MODULE_TYPE_ZIP_FILE, TAG_GRAMMAR_VALUE_MODULE_TYPE_DOWNLOAD):
+            mod_obj_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, TAG_DIR_NOARCH)
+        else:
+            mod_obj_dir = os.path.join(self._sysinfo[TAG_CFG_DIR_OBJ], description.module_name, used_model_name, build_config)
+        mkdir_safe(mod_obj_dir)
+        mod_pre_build_stamp_file = os.path.join(mod_obj_dir, PRE_BUILD_OBJ_STAMP_FILE)
+        if os.path.isfile(mod_pre_build_stamp_file):
+            if rebuild_level < 1:
+                return
+            else:
+                os.remove(mod_pre_build_stamp_file)
+        if noarch:
+            ext_type = TAG_GRAMMAR_VALUE_EXT_TYPE_PRE_BUILD_NOARCH
+            ext_list = description.pre_build_noarch
+        else:
+            ext_type = TAG_GRAMMAR_VALUE_EXT_TYPE_PRE_BUILD
+            ext_list = description.pre_build
+        for ext_name in ext_list:
+            ext_action = self._create_ext_action(ext_type, ext_name, description, used_model_name, build_config, rebuild_level)
+            ext_action()
+        touch_file(mod_pre_build_stamp_file)
 
     def _perform_post_build(self, description, used_model_name, build_config, rebuild_level):
         for ext_name in description.post_build:
