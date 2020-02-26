@@ -142,6 +142,7 @@ MSVS_VERSIONS_MAPPING = (
     ['2013', ('VS120COMNTOOLS',),  _env_test,      _env_batch32,     None             ],
     ['2015', ('VS140COMNTOOLS',),  _env_test,      _env_batch32,     None             ],
     ['2017', ('[15.0,16.0)',),     _vswhere_test,  _vswhere_batch32, _vswhere_batch64 ],
+    ['2019', ('[16.0,17.0)',),     _vswhere_test,  _vswhere_batch32, _vswhere_batch64 ],
 )
 
 
